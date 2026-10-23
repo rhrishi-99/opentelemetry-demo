@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
+import re
 from unittest.mock import MagicMock
 
 from oncall.tools import TOOL_SCHEMAS, TOOLS
 from oncall.tools.backends import BackendError, OfflineBackend
-from oncall.tools.metrics import PROMQL, get_metrics
+from oncall.tools.metrics import PROMQL, _build_promql, get_metrics
 
 
 def test_tool_registration() -> None:
@@ -123,3 +124,83 @@ def test_get_metrics_with_offline_backend() -> None:
     assert (
         "No metric data returned" in result["summary"] or len(result["evidence"]) >= 0
     )
+
+
+def _vector(*series: tuple[dict, str]) -> dict:
+    return {
+        "status": "success",
+        "data": {"result": [{"metric": m, "value": [100, v]} for m, v in series]},
+    }
+
+
+def test_every_promql_selector_excludes_flagd() -> None:
+    for name in PROMQL:
+        metric, scope = name.rsplit("_", 1)
+        promql = _build_promql(metric, "cart" if scope == "service" else None, "5m")
+        # Each metric selector: the metric name followed by its {...} label matchers
+        selectors = re.findall(r"traces_span_metrics_\w+\{[^}]*\}", promql)
+        assert selectors, name
+        for selector in selectors:
+            assert 'service_name!="flagd"' in selector, (name, selector)
+
+
+def test_flagd_dropped_from_results() -> None:
+    backend = MagicMock()
+    vec = _vector(
+        ({"service_name": "flagd"}, "0.9"),
+        ({"service_name": "cart"}, "0.2"),
+    )
+    backend.prom_query.side_effect = [vec, vec]
+    result = get_metrics(metric="error_rate", backend=backend)
+    assert "flagd" not in result["summary"]
+    assert all("flagd" not in e["id"] + e["text"] for e in result["evidence"])
+
+
+def test_evidence_ids_unique_per_series_and_promql_in_query() -> None:
+    backend = MagicMock()
+    vec = _vector(
+        ({"service_name": "payment"}, "0.3"),
+        ({"service_name": "checkout"}, "0.1"),
+    )
+    backend.prom_query.side_effect = [vec, vec]
+    result = get_metrics(metric="error_rate", backend=backend)
+    ids = [e["id"] for e in result["evidence"]]
+    assert len(ids) == len(set(ids)) == 2
+    assert ids[0].startswith("metric:error_rate:payment@")
+    assert result["query"]["promql"] == _build_promql("error_rate", None, "5m")
+
+
+def test_top_errors_series_keyed_by_service_and_span() -> None:
+    backend = MagicMock()
+    vec = _vector(
+        ({"service_name": "cart", "span_name": "GetCart"}, "0.3"),
+        ({"service_name": "cart", "span_name": "AddItem"}, "0.2"),
+    )
+    backend.prom_query.side_effect = [vec, vec]
+    result = get_metrics(metric="top_errors", backend=backend)
+    ids = {e["id"].split("@")[0] for e in result["evidence"]}
+    assert ids == {"metric:top_errors:cart/GetCart", "metric:top_errors:cart/AddItem"}
+
+
+def test_single_service_series_named_after_service() -> None:
+    backend = MagicMock()
+    vec = _vector(({}, "0.25"))
+    backend.prom_query.side_effect = [vec, vec]
+    result = get_metrics(service="cart", metric="error_rate", backend=backend)
+    assert result["evidence"][0]["id"].startswith("metric:error_rate:cart@")
+
+
+def test_clients_listed_as_symptoms_not_candidates() -> None:
+    backend = MagicMock()
+    vec = _vector(
+        ({"service_name": "load-generator"}, "0.9"),
+        ({"service_name": "payment"}, "0.3"),
+    )
+    backend.prom_query.side_effect = [vec, vec]
+    result = get_metrics(metric="error_rate", backend=backend)
+    lines = result["summary"].splitlines()
+    assert lines[1].startswith("  1. payment:")
+    assert not any(re.match(r"\s+\d+\. load-generator", line) for line in lines)
+    assert lines[-1].startswith("User-facing symptoms")
+    assert "load-generator: now=0.9000" in lines[-1]
+    assert any("load-generator" in e["id"] for e in result["evidence"])

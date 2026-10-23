@@ -6,41 +6,45 @@ import math
 from datetime import UTC, datetime
 from typing import Any, Literal
 
+from oncall.agent.taxonomy import CLIENT_SERVICES
 from oncall.models import Evidence, ToolResult, make_error, make_result
 from oncall.tools.backends import BackendError, TelemetryBackend, get_backend
 from oncall.tools.registry import register_tool
 
+# Never report flagd: it is excluded in every selector and dropped from results.
+EXCLUDED_SERVICES = ("flagd",)
+
 # Module-level PROMQL dictionary so F14 (alert detector) can reuse the exact queries
 PROMQL = {
     "error_rate_all": (
-        'sum by (service_name) (rate(traces_span_metrics_calls_total{status_code="STATUS_CODE_ERROR"}[{window}])) / '
-        "sum by (service_name) (rate(traces_span_metrics_calls_total[{window}]))"
+        'sum by (service_name) (rate(traces_span_metrics_calls_total{service_name!="flagd",status_code="STATUS_CODE_ERROR"}[{window}])) / '
+        'sum by (service_name) (rate(traces_span_metrics_calls_total{service_name!="flagd"}[{window}]))'
     ),
     "error_rate_service": (
-        'sum (rate(traces_span_metrics_calls_total{service_name="{service}",status_code="STATUS_CODE_ERROR"}[{window}])) / '
-        'sum (rate(traces_span_metrics_calls_total{service_name="{service}"}[{window}]))'
+        'sum (rate(traces_span_metrics_calls_total{service_name="{service}",service_name!="flagd",status_code="STATUS_CODE_ERROR"}[{window}])) / '
+        'sum (rate(traces_span_metrics_calls_total{service_name="{service}",service_name!="flagd"}[{window}]))'
     ),
     "latency_p95_all": (
         "histogram_quantile(0.95, sum by (le, service_name) "
-        "(rate(traces_span_metrics_duration_ms_bucket[{window}])))"
+        '(rate(traces_span_metrics_duration_ms_bucket{service_name!="flagd"}[{window}])))'
     ),
     "latency_p95_service": (
         "histogram_quantile(0.95, sum by (le) "
-        '(rate(traces_span_metrics_duration_ms_bucket{service_name="{service}"}[{window}])))'
+        '(rate(traces_span_metrics_duration_ms_bucket{service_name="{service}",service_name!="flagd"}[{window}])))'
     ),
     "rps_all": (
-        "sum by (service_name) (rate(traces_span_metrics_calls_total[{window}]))"
+        'sum by (service_name) (rate(traces_span_metrics_calls_total{service_name!="flagd"}[{window}]))'
     ),
     "rps_service": (
-        'sum (rate(traces_span_metrics_calls_total{service_name="{service}"}[{window}]))'
+        'sum (rate(traces_span_metrics_calls_total{service_name="{service}",service_name!="flagd"}[{window}]))'
     ),
     "top_errors_all": (
         "topk(5, sum by (service_name, span_name) "
-        '(rate(traces_span_metrics_calls_total{status_code="STATUS_CODE_ERROR"}[{window}])))'
+        '(rate(traces_span_metrics_calls_total{service_name!="flagd",status_code="STATUS_CODE_ERROR"}[{window}])))'
     ),
     "top_errors_service": (
         "topk(5, sum by (span_name) "
-        '(rate(traces_span_metrics_calls_total{service_name="{service}",status_code="STATUS_CODE_ERROR"}[{window}])))'
+        '(rate(traces_span_metrics_calls_total{service_name="{service}",service_name!="flagd",status_code="STATUS_CODE_ERROR"}[{window}])))'
     ),
 }
 
@@ -56,21 +60,25 @@ def _build_promql(metric: str, service: str | None, window: str) -> str:
     return query
 
 
-def _extract_vector_results(data: dict[str, Any]) -> dict[str, float]:
-    """Parse Prometheus vector query result into a dict of label/key -> float value."""
+def _extract_vector_results(
+    data: dict[str, Any], service: str | None = None
+) -> dict[str, float]:
+    """Parse a Prometheus vector into {series key: value}.
+
+    The key is "<service>" or "<service>/<span>", falling back to `service`
+    when the query aggregated the service label away.
+    """
     res_data = data.get("data", {})
     results = res_data.get("result", [])
     parsed: dict[str, float] = {}
 
     for item in results:
-        metric_labels = item.get("metric", {})
-        # Use service_name or span_name or __name__
-        label_key = (
-            metric_labels.get("service_name")
-            or metric_labels.get("span_name")
-            or metric_labels.get("__name__")
-            or "value"
-        )
+        labels = item.get("metric", {})
+        series_service = labels.get("service_name") or service
+        if series_service in EXCLUDED_SERVICES:
+            continue
+        parts = [p for p in (series_service, labels.get("span_name")) if p]
+        label_key = "/".join(parts) or labels.get("__name__") or "value"
         val_entry = item.get("value", [0, "0"])
         try:
             val = float(val_entry[1])
@@ -80,6 +88,10 @@ def _extract_vector_results(data: dict[str, Any]) -> dict[str, float]:
             continue
 
     return parsed
+
+
+def _is_client(key: str) -> bool:
+    return key.split("/", 1)[0] in CLIENT_SERVICES
 
 
 @register_tool(
@@ -134,6 +146,7 @@ def get_metrics(
 
     window = f"{window_min}m"
     promql = _build_promql(metric, service, window)
+    query_args["promql"] = promql
 
     now_dt = datetime.now(UTC)
     now_ts = now_dt.timestamp()
@@ -146,8 +159,8 @@ def get_metrics(
     except BackendError as exc:
         return make_error("get_metrics", query_args, str(exc))
 
-    now_values = _extract_vector_results(now_resp)
-    base_values = _extract_vector_results(base_resp)
+    now_values = _extract_vector_results(now_resp, service)
+    base_values = _extract_vector_results(base_resp, service)
 
     # Gather all entities (services or spans)
     all_keys = set(now_values.keys()) | set(base_values.keys())
@@ -180,28 +193,37 @@ def get_metrics(
     # Sort: descending by current value and delta
     stats.sort(key=lambda x: (x["current"], x["delta"]), reverse=True)
 
-    # Build summary and evidence
-    top_entries = stats[:5]
+    # Clients (load-generator) are symptoms, never candidates: keep them out of the ranking
+    candidates = [e for e in stats if not _is_client(e["key"])][:5]
+    clients = [e for e in stats if _is_client(e["key"])]
+
+    def line(entry: dict[str, Any]) -> str:
+        return (
+            f"{entry['key']}: now={entry['current']:.4f}, "
+            f"baseline={entry['baseline']:.4f}, delta={entry['delta']:+.4f}"
+        )
+
     summary_lines = [
         f"Metrics for {metric} (window={window}, vs baseline -{baseline_offset_min}m):"
     ]
-    evidence_list: list[Evidence] = []
-
-    for rank, entry in enumerate(top_entries, 1):
-        key = entry["key"]
-        c = entry["current"]
-        b = entry["baseline"]
-        d = entry["delta"]
+    summary_lines += [f"  {rank}. {line(e)}" for rank, e in enumerate(candidates, 1)]
+    if clients:
         summary_lines.append(
-            f"  {rank}. {key}: now={c:.4f}, baseline={b:.4f}, delta={d:+.4f}"
+            "User-facing symptoms (clients, not root-cause candidates): "
+            + "; ".join(line(e) for e in clients)
         )
-        evidence_list.append(
-            {
-                "id": f"metric:{promql}@{iso_ts}",
-                "text": f"{key} {metric} {c:.4f} (baseline {b:.4f}, delta {d:+.4f})",
-                "ts": iso_ts,
-            }
-        )
+
+    evidence_list: list[Evidence] = [
+        {
+            "id": f"metric:{metric}:{e['key']}@{iso_ts}",
+            "text": (
+                f"{e['key']} {metric} {e['current']:.4f} "
+                f"(baseline {e['baseline']:.4f}, delta {e['delta']:+.4f})"
+            ),
+            "ts": iso_ts,
+        }
+        for e in candidates + clients
+    ]
 
     return make_result(
         tool="get_metrics",

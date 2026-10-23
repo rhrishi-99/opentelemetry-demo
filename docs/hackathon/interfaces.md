@@ -17,7 +17,7 @@ Defined in `oncall/models.py` (F01). Build it with `make_result()` / `make_error
   "error": None
 }
 ```
-Evidence id formats: `metric:<promql>@<iso_ts>`, `trace:<trace_id>/span:<span_name>`,
+Evidence id formats: `metric:<metric>:<series>@<iso_ts>` (series = `<service>` or `<service>/<span>`; the PromQL is in `query["promql"]`), `trace:<trace_id>/span:<span_name>`,
 `log:<service>@<iso_ts>`, `container:<name>`, `deploy:<id>`.
 
 ## Alert
