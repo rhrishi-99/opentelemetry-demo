@@ -69,3 +69,4 @@ src/shipping/target/
 # Hackathon agent (oncall/)
 oncall/.env
 runs/
+scripts/faultctl/.state.json

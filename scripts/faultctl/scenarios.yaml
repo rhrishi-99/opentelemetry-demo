@@ -1,0 +1,22 @@
+# faultctl scenarios. Ids are neutral; nothing under oncall/ may read this file.
+# Types: stop, cpu_limit (params.cpus), mem_limit (params.memory, e.g. 230m).
+# TODO(F18): flag scenarios once the flagd write mechanism is verified.
+scenarios:
+  scenario-06:
+    type: stop
+    target: valkey-cart
+    description: cart cache stopped
+  scenario-07:
+    type: stop
+    target: email
+    description: email service container stopped
+  scenario-08:
+    type: cpu_limit
+    target: product-catalog
+    params: {cpus: 0.1}
+    description: product-catalog limited to 0.1 CPU
+  scenario-09:
+    type: mem_limit
+    target: recommendation
+    params: {memory: 230m}
+    description: recommendation memory limit squeezed close to its usage
