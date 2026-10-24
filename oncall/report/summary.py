@@ -59,7 +59,8 @@ MAX_USER_IMPACTS = 2
 LINE_CHARS = 110
 # get_metrics evidence: "<service> <metric> <now> (baseline <base>, delta ...)".
 METRIC_TEXT = re.compile(
-    r"^(?P<service>\S+) (?P<metric>\w+) (?P<now>[0-9.]+) \(baseline (?P<base>[0-9.]+)"
+    r"^(?P<service>\S+) (?P<metric>\w+) (?P<now>[0-9.]+) "
+    r"\((?:baseline (?P<base>[0-9.]+)|baseline unavailable)"
 )
 # search_logs evidence: "x<count> [<service>] <first line>".
 LOG_TEXT = re.compile(r"^x(?P<count>\d+) \[(?P<service>[^\]]+)\] (?P<line>.*)$")
@@ -200,10 +201,12 @@ def short_evidence(eid: str, text: str) -> str:
     if kind == "metric" and (m := METRIC_TEXT.match(text or "")):
         metric = m["metric"]
         words = METRIC_WORDS.get(metric, metric).replace("errors", "error rate")
-        return (
-            f"{m['service']} {words} {fmt_metric(metric, float(m['now']))} "
-            f"(baseline {fmt_metric(metric, float(m['base']))})"
+        base = (
+            "no baseline"
+            if m["base"] is None
+            else f"baseline {fmt_metric(metric, float(m['base']))}"
         )
+        return f"{m['service']} {words} {fmt_metric(metric, float(m['now']))} ({base})"
     return _short(text, 90)
 
 
@@ -215,7 +218,12 @@ def _about(evidence: dict, eid: str, name: str) -> bool:
 def _broken(d: dict, names: list[str], index: dict) -> list[str]:
     lines = []
     for name in names:
-        about = [eid for eid in index if _about(index[eid], eid, name)]
+        about = [
+            eid
+            for eid in index
+            if _about(index[eid], eid, name)
+            and (not eid.startswith("metric:") or _regressed_metric(index[eid]))
+        ]
         about.sort(
             key=lambda e: (
                 SOURCE_STRENGTH.index(e.split(":", 1)[0])
@@ -246,7 +254,7 @@ def _impact(d: dict, names: list[str], index: dict) -> list[str]:
         if not eid.startswith("metric:"):
             continue
         m = METRIC_TEXT.match(item.get("text") or "")
-        if not m or m["service"] in CLIENT_SERVICES:
+        if not m or m["service"] in CLIENT_SERVICES or m["base"] is None:
             continue
         now, base, metric = float(m["now"]), float(m["base"]), m["metric"]
         worse = now > base * 1.5 if metric == "rps" else now > base
@@ -269,9 +277,24 @@ def _impact(d: dict, names: list[str], index: dict) -> list[str]:
 
 
 def _worse(eid: str, text: str) -> bool:
-    """False for a metric that did not get worse than its baseline."""
-    m = METRIC_TEXT.match(text) if eid.startswith("metric:") else None
-    return m is None or float(m["now"]) > float(m["base"])
+    """False for a metric that did not get worse than its baseline (or has none)."""
+    if not eid.startswith("metric:"):
+        return True
+    m = METRIC_TEXT.match(text)
+    if m is None:
+        return True
+    return m["base"] is not None and float(m["now"]) > float(m["base"])
+
+
+def _regressed_metric(item: dict) -> bool:
+    """A clear regression: errors >=1% and up, p95 or rps up by half or more."""
+    m = METRIC_TEXT.match(item.get("text") or "")
+    if not m or m["base"] is None:
+        return False
+    now, base = float(m["now"]), float(m["base"])
+    if m["metric"] == "error_rate":
+        return now >= 0.01 and now > base
+    return now > base * 1.5
 
 
 def _why(d: dict, names: list[str], index: dict) -> list[dict]:
@@ -319,8 +342,12 @@ def _not_cause(d: dict, names: list[str], index: dict) -> list[str]:
             and "state=running" in text
         ):
             items.append(f"{name} container healthy")
+    down = flagged_containers(index, down_only=True)
     for a in d.get("alternatives") or []:
-        items.append(_short(f"{a.get('hypothesis')} — {a.get('rejected_because')}", 90))
+        hypothesis = str(a.get("hypothesis") or "")
+        if any(name in hypothesis for name in down):
+            continue
+        items.append(_short(f"{hypothesis} — {a.get('rejected_because')}", 90))
     return items[:MAX_NOT_CAUSE]
 
 

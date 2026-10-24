@@ -4,7 +4,7 @@ import json
 import re
 
 from oncall.agent.confidence import assess
-from oncall.agent.diagnosis import diagnose, escalate_unknown
+from oncall.agent.diagnosis import container_precedence, diagnose, escalate_unknown
 from oncall.agent.evidence import validate
 from oncall.agent.llm import LLM, LLMError
 from oncall.agent.prompts import INVESTIGATE, SYSTEM
@@ -326,7 +326,9 @@ def investigate_and_diagnose(
 
 
 def finalise(d: Diagnosis, runlog: RunLog) -> Diagnosis:
-    """Validate the evidence (F13), then set confidence and decision (F15)."""
+    """Container precedence, then validate the evidence (F13), then set
+    confidence and decision (F15)."""
+    d = container_precedence(d, runlog)
     d, problems = validate(d, runlog)
     runlog.log("decision", stage="validated", diagnosis=d, problems=problems)
     d = assess(d, runlog)

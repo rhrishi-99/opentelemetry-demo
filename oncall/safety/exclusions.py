@@ -24,6 +24,24 @@ PROMQL_EXCLUDE = 'service_name!~"{}",span_name!~"(?i).*flag.*"'.format(
 FIXTURE_SCRUB = re.compile(r"flagd-ui|flagd|ofrep", re.IGNORECASE)
 
 
+# The telemetry stack: never a root-cause candidate, and its own logs and spans
+# are noise unless a query asks for one of them by name.
+INFRA_SERVICES: frozenset[str] = frozenset(
+    {
+        "otelcol-contrib",
+        "otel-collector",
+        "jaeger",
+        "prometheus",
+        "opensearch",
+        "grafana",
+    }
+)
+
+
+def is_infra(service: str | None) -> bool:
+    return service in INFRA_SERVICES
+
+
 def is_excluded(service: str | None) -> bool:
     return service in EXCLUDED_SERVICES
 

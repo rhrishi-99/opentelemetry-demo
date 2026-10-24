@@ -13,7 +13,7 @@ from oncall.models import (
     make_error,
     make_result,
 )
-from oncall.safety.exclusions import is_excluded, is_excluded_span
+from oncall.safety.exclusions import is_excluded, is_excluded_span, is_infra
 from oncall.tools.backends import BackendError, TelemetryBackend, get_backend
 from oncall.tools.registry import register_tool
 
@@ -82,13 +82,16 @@ def _depth(span_id: str, parents: dict[str, str]) -> int:
     return depth
 
 
-def _trace_errors(trace: dict[str, Any]) -> list[dict[str, Any]]:
+def _trace_errors(
+    trace: dict[str, Any], asked: str | None = None
+) -> list[dict[str, Any]]:
     spans = [
         span
         for span in trace.get("spans", [])
         if isinstance(span, dict)
         and not is_excluded(span.get("service"))
         and not is_excluded_span(span.get("name"))
+        and not (is_infra(span.get("service")) and span.get("service") != asked)
     ]
     parents = {
         str(s["spanId"]): str(s["parentSpanId"]) for s in spans if s.get("parentSpanId")
@@ -165,7 +168,7 @@ def search_traces(
     seen_ids: set[str] = set()
     error_trace_count = 0
     for trace in inspected:
-        errors = _trace_errors(trace)
+        errors = _trace_errors(trace, service)
         if not errors:
             continue
         error_trace_count += 1

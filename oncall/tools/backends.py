@@ -24,6 +24,7 @@ from oncall.models import FLAG_PATTERN, FLAG_REDACTED, scrub_flags
 from oncall.safety.exclusions import (
     EXCLUDED_SERVICES,
     FIXTURE_SCRUB,
+    INFRA_SERVICES,
     PROMQL_EXCLUDE,
     is_excluded,
     is_excluded_span,
@@ -416,7 +417,14 @@ class LiveBackend:
                             "must_not": [
                                 {
                                     "terms": {
-                                        LOG_SERVICE_FIELD: sorted(EXCLUDED_SERVICES)
+                                        LOG_SERVICE_FIELD: sorted(
+                                            EXCLUDED_SERVICES
+                                            | (
+                                                set()
+                                                if service in INFRA_SERVICES
+                                                else INFRA_SERVICES
+                                            )
+                                        )
                                     }
                                 }
                             ],

@@ -178,10 +178,30 @@ def get_metrics(
             evidence=[],
         )
 
+    # A series absent from the baseline means no data for that service then, not
+    # zero. Except error_rate, a ratio with no series when there were no errors:
+    # there a service that had traffic at the baseline had a 0.0 error rate.
+    had_traffic: set[str] = set()
+    if has_baseline and metric == "error_rate" and set(now_values) - set(base_values):
+        try:
+            rps_base = backend.prom_query(
+                _build_promql("rps", service, window), at=baseline_ts
+            )
+            had_traffic = set(_extract_vector_results(rps_base, service))
+        except BackendError:
+            had_traffic = set()
+
+    def baseline_of(key: str) -> float | None:
+        if not has_baseline:
+            return None
+        if key in base_values:
+            return base_values[key]
+        return 0.0 if key.split("/", 1)[0] in had_traffic else None
+
     stats: list[dict[str, Any]] = []
     for key in all_keys:
         curr = now_values.get(key, 0.0)
-        base = base_values.get(key, 0.0) if has_baseline else None
+        base = baseline_of(key)
         delta = None if base is None else curr - base
         stats.append({"key": key, "current": curr, "baseline": base, "delta": delta})
 

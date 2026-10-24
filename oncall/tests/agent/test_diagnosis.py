@@ -380,3 +380,88 @@ def test_fallback_tie_goes_to_the_container_users_depend_on(tmp_path):
     assert d["component"] == "valkey-cart"
     assert d["category"] == "container_down"
     assert d["affected_services"] == ["valkey-cart", "email"]
+
+
+def _cart_errors(rl):
+    rl.log(
+        "tool_result",
+        step=3,
+        name="get_metrics",
+        result=make_result(
+            "get_metrics",
+            {},
+            "errors",
+            [
+                {
+                    "id": "metric:error_rate:cart@t",
+                    "text": "cart error_rate 0.3000 (baseline 0.0000, delta +0.3)",
+                    "ts": None,
+                },
+                {
+                    "id": "metric:error_rate:checkout@t",
+                    "text": "checkout error_rate 0.0000 (baseline 0.0000, delta +0)",
+                    "ts": None,
+                },
+            ],
+        ),
+    )
+
+
+def _llm_pick(**over):
+    return valid(
+        component="cart",
+        category="app_error",
+        evidence_ids=["metric:error_rate:cart@t"],
+        alternatives=[
+            {"hypothesis": "valkey-cart is down", "rejected_because": "not checked"}
+        ],
+        **over,
+    )
+
+
+def test_precedence_moves_the_llm_pick_to_alternatives(tmp_path):
+    rl = RunLog(run_id="p1", runs_dir=str(tmp_path))
+    _logs(rl, ("log:cart:1@t", "x12 [cart] Wasn't able to connect to redis"))
+    _cart_errors(rl)
+    _containers(rl, VALKEY_DOWN, "cart: state=running, health=healthy")
+    d = diagnosis.container_precedence(_llm_pick(), rl)
+    assert d["component"] == "valkey-cart"
+    assert d["category"] == "dependency_unavailable"
+    assert d["affected_services"] == ["cart"]
+    assert d["alternatives"][0] == {
+        "hypothesis": "cart is the root cause (app_error)",
+        "rejected_because": "downstream symptom of valkey-cart being down",
+    }
+    # The down container never stays among the rejected alternatives.
+    assert all("valkey-cart" not in a["hypothesis"] for a in d["alternatives"])
+    assert d["evidence_ids"][:2] == ["container:valkey-cart", "log:cart:1@t"]
+    assert "metric:error_rate:cart@t" in d["evidence_ids"]
+    assert d["reasoning"].startswith("[precedence rule applied: valkey-cart is down")
+    logged = [e for e in rl.events("decision") if e.get("stage") == "precedence"]
+    assert logged and logged[0]["rule"] == "precedence rule applied"
+
+
+def test_precedence_with_metric_regressions_only_is_container_down(tmp_path):
+    rl = RunLog(run_id="p2", runs_dir=str(tmp_path))
+    _cart_errors(rl)
+    _containers(rl, VALKEY_DOWN)
+    d = diagnosis.container_precedence(_llm_pick(), rl)
+    assert (d["component"], d["category"]) == ("valkey-cart", "container_down")
+    assert d["affected_services"] == ["cart"]
+
+
+def test_precedence_needs_one_down_container_and_a_symptom(tmp_path):
+    rl = RunLog(run_id="p3", runs_dir=str(tmp_path))
+    _containers(rl, VALKEY_DOWN)
+    assert diagnosis.container_precedence(_llm_pick(), rl)["component"] == "cart"
+    rl2 = RunLog(run_id="p4", runs_dir=str(tmp_path))
+    _cart_errors(rl2)
+    _containers(rl2, VALKEY_DOWN, EMAIL_DOWN)
+    assert diagnosis.container_precedence(_llm_pick(), rl2)["component"] == "cart"
+
+
+def test_telemetry_infra_is_never_the_component(run):
+    d = diagnose(run, ALERT, ScriptedLLM([submit(valid(component="otelcol-contrib"))]))
+    assert d["component"] is None
+    assert d["decision"] == "escalate"
+    assert "telemetry infra" in d["reasoning"]

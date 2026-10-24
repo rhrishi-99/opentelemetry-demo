@@ -191,3 +191,46 @@ def test_unknown_with_down_containers_in_evidence_is_a_combo():
     assert s["headline"] == "Multiple failures: email, valkey-cart"
     assert all("load-generator" not in line for line in s["impact"])
     assert all("2026-" not in w["text"] for w in s["why"])
+
+
+def test_broken_never_shows_an_unregressed_metric():
+    index = {
+        "metric:error_rate:checkout@t": {
+            "text": "checkout error_rate 0.0000 (baseline 0.0000, delta +0)"
+        },
+    }
+    d = diagnosis(component="checkout", category="app_error", evidence_ids=[])
+    s = summary.build_summary(d, [], index)
+    assert all("0% (baseline 0%)" not in line for line in s["broken"])
+
+
+def test_down_container_never_listed_as_not_the_cause():
+    d = diagnosis(
+        component="cart",
+        category="app_error",
+        alternatives=[
+            {"hypothesis": "valkey-cart is down", "rejected_because": "cart errors"},
+            {"hypothesis": "network", "rejected_because": "no timeouts"},
+        ],
+    )
+    s = summary.build_summary(d, EVENTS, INDEX)
+    assert all("valkey-cart" not in item for item in s["not_cause"])
+    assert any(item.startswith("network") for item in s["not_cause"])
+
+
+def test_missing_baseline_shows_no_baseline_not_a_delta():
+    index = {
+        "metric:latency_p95:checkout@t": {
+            "text": "checkout latency_p95 4900.0000 (baseline unavailable)"
+        },
+    }
+    assert (
+        summary.short_evidence(
+            "metric:latency_p95:checkout@t",
+            index["metric:latency_p95:checkout@t"]["text"],
+        )
+        == "checkout p95 4.9 s (no baseline)"
+    )
+    d = diagnosis(component="checkout", category="app_error", evidence_ids=[])
+    s = summary.build_summary(d, [], index)
+    assert all("→" not in line for line in s["impact"])

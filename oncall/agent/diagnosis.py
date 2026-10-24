@@ -11,6 +11,7 @@ from oncall.agent.prompts import DIAGNOSE
 from oncall.agent.runlog import RunLog
 from oncall.models import Alert, Category, Diagnosis, llm_query
 from oncall.safety.allowlist import DEMO_SERVICES
+from oncall.safety.exclusions import INFRA_SERVICES
 
 SUBMIT = "submit_diagnosis"
 MAX_REASONING_CHARS = 800
@@ -152,6 +153,97 @@ def _impact(name: str, errors: int, callers: list[str]) -> str:
     return "no user-facing errors"
 
 
+def _metric_regression(text: str) -> str | None:
+    """The service whose error rate (>=3x, >=2%) or p95 (>=2x) regressed, if any."""
+    m = METRIC_TEXT.match(text)
+    if not m:
+        return None
+    now, base = float(m["now"]), float(m["base"])
+    if m["metric"] == "error_rate":
+        regressed = now >= 0.02 and now >= 3 * base
+    elif m["metric"] == "latency_p95":
+        regressed = base > 0 and now >= 2 * base
+    else:
+        regressed = False
+    return text.split(" ", 1)[0].split("/", 1)[0] if regressed else None
+
+
+def container_precedence(d: Diagnosis, run: RunLog) -> Diagnosis:
+    """A single down demo container whose dependents show symptoms is the cause.
+
+    Applies when exactly one demo container is down, restarting or OOM-killed and
+    another service regressed or its logs/traces name the container (or an
+    alias). The LLM's own pick becomes a rejected alternative."""
+    down = down_containers(run)
+    if len(down) != 1:
+        return d
+    ((name, (container_id, problems)),) = down.items()
+    if d.get("component") == name:
+        return d
+    index = run.evidence_index()
+    ids, _, callers = support(name, index)
+    regressed = [
+        svc
+        for eid, item in index.items()
+        if eid.startswith("metric:")
+        and (svc := _metric_regression(item.get("text") or ""))
+        and svc != name
+        and svc not in taxonomy.CLIENT_SERVICES
+        and svc not in INFRA_SERVICES
+    ]
+    dependents = list(dict.fromkeys([*callers, *regressed]))
+    if not dependents:
+        return d
+    rejected = [
+        a
+        for a in d.get("alternatives") or []
+        if name not in f"{a.get('hypothesis')} {a.get('rejected_because')}"
+    ]
+    if d.get("component"):
+        rejected.insert(
+            0,
+            {
+                "hypothesis": f"{d['component']} is the root cause ({d.get('category')})",
+                "rejected_because": f"downstream symptom of {name} being down",
+            },
+        )
+    regressed_ids = [
+        eid
+        for eid, item in index.items()
+        if eid.startswith("metric:")
+        and _metric_regression(item.get("text") or "") in dependents
+    ]
+    out: Diagnosis = {
+        **d,
+        "component": name,
+        "category": "dependency_unavailable" if callers else "container_down",
+        "cause": f"{name} is down ({problems}); "
+        f"{', '.join(dependents)} show the symptoms",
+        "confidence": max(float(d.get("confidence") or 0), FALLBACK_CONFIDENCE),
+        "evidence_ids": list(
+            dict.fromkeys(
+                [container_id, *ids, *regressed_ids, *(d.get("evidence_ids") or [])]
+            )
+        ),
+        "affected_services": dependents,
+        "alternatives": rejected,
+        "decision": "act",
+        "reasoning": (
+            f"[precedence rule applied: {name} is down, {', '.join(dependents)} "
+            f"depend on it] {d.get('reasoning', '')}"
+        )[:MAX_REASONING_CHARS],
+    }
+    run.log(
+        "decision",
+        stage="precedence",
+        rule="precedence rule applied",
+        container=name,
+        replaced=d.get("component"),
+        diagnosis=out,
+    )
+    return out
+
+
 def rule_based(run: RunLog, alert: Alert, why: str) -> Diagnosis:
     """Diagnose from the run log alone when the LLM cannot.
 
@@ -259,14 +351,15 @@ def _post_check(raw: dict) -> Diagnosis:
         "decision": raw["decision"],
         "reasoning": raw["reasoning"],
     }
-    if d["component"] in taxonomy.CLIENT_SERVICES:
+    if d["component"] in (*taxonomy.CLIENT_SERVICES, *INFRA_SERVICES):
         client = d["component"]
+        kind = "a client" if client in taxonomy.CLIENT_SERVICES else "telemetry infra"
         d["component"] = None
         d["decision"] = "escalate"
         if client not in d["affected_services"]:
             d["affected_services"].append(client)
         d["reasoning"] = (
-            f"[post-check: {client} is a client, so it cannot be the root cause] "
+            f"[post-check: {client} is {kind}, so it cannot be the root cause] "
             + d["reasoning"]
         )
     d["reasoning"] = d["reasoning"][:MAX_REASONING_CHARS]
