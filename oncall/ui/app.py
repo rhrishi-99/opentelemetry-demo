@@ -36,6 +36,7 @@ from oncall.platform.containers import (
     inspect_containers,
 )
 from oncall.report.output import report_run
+from oncall.safety.actionlog import read_action_log
 from oncall.safety.exclusions import EXCLUDED_SERVICES
 from oncall.tools import TOOLS
 from oncall.tools.backends import BackendError, LiveBackend, get_backend
@@ -49,7 +50,12 @@ ENV_KEYS = {
     "opensearch": "OPENSEARCH_URL",
 }
 MAX_PAST_RUNS = 30
-NO_ACTION_CAPTION = "Approval gate + Action API land on Day 2 (F19/F22)"
+AGENT_STAGES = (
+    ("Detective", {"detective"}),
+    ("Planner", {"planner"}),
+    ("Human", {"human", "human_gate"}),
+    ("Operator", {"operator"}),
+)
 
 # container_health evidence text: "<name>: state=<state>, health=<health>, ..."
 CONTAINER_TEXT = re.compile(r"^(?P<name>[^:]+): state=(?P<state>[^,]+),")
@@ -539,17 +545,245 @@ def render_diagnosis(runlog: RunLog, d: dict) -> None:
                 st.warning("Not found in this run's evidence index.")
 
 
-def render_action(events: list[dict]) -> None:
-    st.subheader("Action")
-    actions = [e for e in events if e["event"] == "action"]
-    if actions:
-        st.json(actions[-1])
+def handoff_stages(events: list[dict]) -> dict[str, bool]:
+    """Return which agent stages have appeared in a hand-off event."""
+    seen: set[str] = set()
+    for event in events:
+        if event.get("event") != "handoff":
+            continue
+        for field in ("from_agent", "to_agent", "from", "to"):
+            value = event.get(field)
+            if isinstance(value, str):
+                seen.add(value.strip().lower().replace(" ", "_"))
+    return {name: bool(aliases & seen) for name, aliases in AGENT_STAGES}
+
+
+def _planner_data(events: list[dict]) -> tuple[dict | None, dict | None, dict | None]:
+    """Find the latest review, proposal, and verification in run events."""
+    review = proposal = verification = None
+    for event in reversed(events):
+        plan = event.get("plan")
+        execution = event.get("execution")
+        if not isinstance(plan, dict) and isinstance(execution, dict):
+            plan = execution.get("plan")
+        if isinstance(plan, dict):
+            if review is None and isinstance(plan.get("review"), dict):
+                review = plan["review"]
+            if proposal is None and isinstance(plan.get("proposal"), dict):
+                proposal = plan["proposal"]
+        if review is None and isinstance(event.get("review"), dict):
+            review = event["review"]
+        if proposal is None and isinstance(event.get("proposal"), dict):
+            proposal = event["proposal"]
+        if verification is None and isinstance(event.get("verification"), dict):
+            verification = event["verification"]
+        if verification is None and isinstance(execution, dict):
+            value = execution.get("verification")
+            if isinstance(value, dict):
+                verification = value
+        if review is not None and proposal is not None and verification is not None:
+            break
+    return review, proposal, verification
+
+
+def _approval_path(settings: Settings, run_id: str) -> Path:
+    if not run_id or re.fullmatch(r"[A-Za-z0-9_-]+", run_id) is None:
+        raise ValueError("Invalid run id for approval path")
+    return Path(settings.RUNS_DIR) / "approvals" / f"{run_id}.json"
+
+
+def write_approval(
+    settings: Settings,
+    run_id: str,
+    approved: bool,
+    by: str,
+    comment: str = "",
+    dry_run: bool = True,
+) -> Path:
+    """Write a human decision and requested execution mode for a run."""
+    approver = by.strip()
+    if not approver:
+        raise ValueError("Enter the name of the person making this decision")
+    path = _approval_path(settings, run_id)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    record = {
+        "approved": bool(approved),
+        "by": approver,
+        "ts": datetime.now(UTC).isoformat(),
+        "comment": comment.strip(),
+        "dry_run": bool(dry_run),
+    }
+    temporary = path.with_suffix(".json.tmp")
+    temporary.write_text(json.dumps(record, indent=2) + "\n", encoding="utf-8")
+    temporary.replace(path)
+    return path
+
+
+def _read_approval(settings: Settings, run_id: str) -> dict | None:
+    path = _approval_path(settings, run_id)
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    return value if isinstance(value, dict) else None
+
+
+def _set_kill_switch(path: Path, enabled: bool) -> None:
+    """Apply an explicit UI toggle to the configured kill-switch file."""
+    if enabled:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.touch(exist_ok=True)
     else:
-        st.caption("No action proposed.")
+        path.unlink(missing_ok=True)
+
+
+def _kill_switch_changed(path: str, state_key: str) -> None:
+    """Persist the user's kill-switch toggle without changing it on reruns."""
+    try:
+        _set_kill_switch(Path(path), bool(st.session_state.get(state_key)))
+    except OSError as exc:
+        st.session_state[f"{state_key}-error"] = str(exc)
+
+
+def action_records(settings: Settings, run_id: str) -> list[dict]:
+    """Read only the requested run's action records and remove flag details."""
+    records = read_action_log(Path(settings.RUNS_DIR) / "actions.jsonl", run_id)
+    return [scrub_flags(record) for record in records]
+
+
+def _render_stage_strip(events: list[dict]) -> None:
+    stages = handoff_stages(events)
+    columns = st.columns(len(AGENT_STAGES))
+    for column, (name, _) in zip(columns, AGENT_STAGES, strict=True):
+        column.markdown(f"{'🟢' if stages[name] else '⚪'} **{name}**")
+
+
+def _render_planner(review: dict | None, proposal: dict | None) -> None:
+    st.subheader("Planner")
+    with st.container(border=True):
+        if review is None:
+            st.caption("No planner review recorded yet.")
+        else:
+            st.caption(
+                "Confidence adjustment: "
+                f"{review.get('confidence_adjustment', 'not recorded')}"
+            )
+            challenges = review.get("challenges", [])
+            if isinstance(challenges, list) and challenges:
+                for challenge in challenges:
+                    if not isinstance(challenge, dict):
+                        continue
+                    status = "Ruled out" if challenge.get("ruled_out") else "Unresolved"
+                    st.markdown(f"**{status}:** {challenge.get('hypothesis', '')}")
+                    if challenge.get("reason"):
+                        st.text(challenge["reason"])
+                    evidence_ids = challenge.get("evidence_ids") or []
+                    if evidence_ids:
+                        st.caption("Evidence: " + ", ".join(map(str, evidence_ids)))
+            else:
+                st.caption("No alternative challenges recorded.")
+
+    st.subheader("Proposal")
+    if proposal is None:
+        st.caption("No proposal recorded.")
+        return
+    with st.container(border=True):
+        st.markdown(
+            f"**{proposal.get('action', 'Action')}** → `{proposal.get('target', '')}`"
+        )
+        if proposal.get("params"):
+            st.json(proposal["params"])
+        st.markdown("**Reason**")
+        st.text(proposal.get("reason", ""))
+        st.markdown("**Expected effect**")
+        st.text(proposal.get("expected_effect", ""))
+        st.caption(
+            f"Risk: {proposal.get('risk', 'unknown')} · "
+            f"Rollback: {proposal.get('rollback_hint', 'not recorded')}"
+        )
+
+
+def _render_human_gate(settings: Settings, run_id: str, proposal: dict | None) -> None:
+    st.subheader("Human gate")
+    kill_path = Path(settings.KILL_SWITCH_FILE)
+    kill_key = f"kill-switch-{run_id}"
+    if (
+        kill_key not in st.session_state
+        or st.session_state[kill_key] != kill_path.exists()
+    ):
+        st.session_state[kill_key] = kill_path.exists()
+    st.toggle(
+        "Kill switch",
+        key=kill_key,
+        on_change=_kill_switch_changed,
+        args=(str(kill_path), kill_key),
+        help="When enabled, the operator must not execute actions.",
+    )
+    kill_enabled = bool(st.session_state[kill_key])
+    kill_error = st.session_state.pop(f"{kill_key}-error", None)
+    if kill_error:
+        st.error(f"Could not update kill switch: {kill_error}")
+
+    execute_for_real = st.toggle(
+        "Execute for real",
+        value=False,
+        disabled=kill_enabled,
+        key=f"execute-for-real-{run_id}",
+        help="Off by default; approval records dry_run=true.",
+    )
+    dry_run = not execute_for_real
+    st.caption("Dry-run mode" if dry_run else "Real execution requested")
+    approval = _read_approval(settings, run_id)
+    if approval:
+        verdict = "Approved" if approval.get("approved") else "Rejected"
+        mode = "dry run" if approval.get("dry_run", True) else "real execution"
+        st.info(f"{verdict} by {approval.get('by', 'unknown')} · {mode}")
+
+    approver = st.text_input("Your name", key=f"approver-{run_id}")
+    comment = st.text_input("Approval note (optional)", key=f"approval-note-{run_id}")
     left, right = st.columns(2)
-    left.button("Approve", disabled=True, width="stretch")
-    right.button("Reject", disabled=True, width="stretch")
-    st.caption(NO_ACTION_CAPTION)
+    can_decide = proposal is not None and bool(approver.strip())
+    if left.button(
+        "Approve",
+        disabled=not can_decide or kill_enabled,
+        width="stretch",
+        key=f"approve-{run_id}",
+    ):
+        path = write_approval(settings, run_id, True, approver, comment, dry_run)
+        st.success(f"Approval saved to {path}")
+    if right.button(
+        "Reject",
+        disabled=not can_decide,
+        width="stretch",
+        key=f"reject-{run_id}",
+    ):
+        path = write_approval(settings, run_id, False, approver, comment, dry_run)
+        st.success(f"Rejection saved to {path}")
+    if proposal is None:
+        st.caption("A proposal is required before it can be approved or rejected.")
+    if kill_enabled:
+        st.warning("Kill switch is on; real execution is disabled.")
+
+
+def _render_action_log(settings: Settings, run_id: str) -> None:
+    st.subheader("Action log")
+    try:
+        records = action_records(settings, run_id)
+    except (OSError, json.JSONDecodeError) as exc:
+        st.warning(f"Could not read action log: {exc}")
+        return
+    if records:
+        st.json(records)
+    else:
+        st.caption("No action records for this run.")
+
+
+def _render_verification(verification: dict | None) -> None:
+    st.subheader("Verification")
+    if verification is None:
+        st.caption("No verification results recorded yet.")
+    else:
+        st.json(verification)
 
 
 def render_run(settings: Settings, run_id: str, running: bool) -> None:
@@ -561,6 +795,12 @@ def render_run(settings: Settings, run_id: str, running: bool) -> None:
         f"run `{run_id}` · {'running…' if running else 'done'} · tokens so far: {tokens}"
     )
     render_steps(events)
+    _render_stage_strip(events)
+    review, proposal, verification = _planner_data(events)
+    _render_planner(review, proposal)
+    _render_human_gate(settings, run_id, proposal)
+    _render_action_log(settings, run_id)
+    _render_verification(verification)
 
     finishes = [e for e in events if e["event"] == "finish"]
     decisions = [e for e in events if e["event"] == "decision" and "diagnosis" in e]
@@ -578,7 +818,6 @@ def render_run(settings: Settings, run_id: str, running: bool) -> None:
     render_diagnosis(runlog, decisions[-1]["diagnosis"])
     if reports:
         st.caption(f"Report: `{reports[-1]['json_path']}` + `{reports[-1]['md_path']}`")
-    render_action(events)
 
 
 @st.fragment(run_every=1)
