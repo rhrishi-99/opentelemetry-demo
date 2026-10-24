@@ -303,3 +303,68 @@ def test_no_healthy_claim_without_all_container_triage(run):
         run.log,
     )
     assert (claimed["category"], claimed["decision"]) == ("unknown", "escalate")
+
+
+def _surge(run, rps_base=7.0, p95_base=900.0):
+    rps = _metric("frontend-proxy", "rps", 24.0, rps_base)
+    p95 = _metric("frontend-proxy", "latency_p95", 3500.0, p95_base)
+    _healthy(run).metrics("rps", rps).metrics("latency_p95", p95)
+    return [rps["id"], p95["id"]]
+
+
+def _surge_d(ids, **over):
+    fields = {
+        "component": "frontend-proxy",
+        "category": "traffic_surge",
+        "evidence_ids": ids,
+        "affected_services": ["frontend-proxy", "frontend"],
+    }
+    return _d(**{**fields, **over})
+
+
+def test_traffic_surge_with_rps_and_latency_can_act(run):
+    d = assess(_surge_d(_surge(run)), run.log)
+    assert (d["category"], d["component"]) == ("traffic_surge", "frontend-proxy")
+    assert (d["decision"], d["confidence"]) == ("act", 0.9)
+
+
+def test_traffic_surge_below_act_threshold_escalates(run):
+    d = assess(_surge_d(_surge(run), confidence=0.65), run.log)
+    assert (d["category"], d["decision"]) == ("traffic_surge", "escalate")
+
+
+def test_traffic_surge_rps_alone_is_one_tool(run):
+    ids = _surge(run)[:1]
+    d = assess(_surge_d(ids), run.log)
+    assert d["category"] == "traffic_surge"
+    assert d["decision"] == "escalate"
+    assert "evidence from one tool only: cap 0.55" in d["reasoning"]
+
+
+def test_traffic_surge_without_rps_baseline_escalates(run):
+    d = assess(_surge_d(_surge(run, rps_base=None)), run.log)
+    assert d["category"] == "traffic_surge"
+    assert d["decision"] == "escalate"
+    assert d["confidence"] <= 0.5
+    assert "no rps baseline for frontend-proxy" in d["reasoning"]
+
+
+def test_small_rps_rise_stays_no_incident(run):
+    ids = _surge(run, rps_base=20.0, p95_base=3400.0)  # 24 vs 20: not a surge
+    d = assess(_surge_d(ids), run.log)
+    assert (d["category"], d["decision"]) == ("no_incident", "no_action")
+
+
+def test_rps_surge_does_not_count_for_other_categories(run):
+    ids = _surge(run, p95_base=3400.0)
+    d = assess(_surge_d(ids, category="app_error"), run.log)
+    assert (d["category"], d["decision"]) == ("no_incident", "no_action")
+
+
+def test_traffic_surge_with_rps_and_entry_errors_from_traces_can_act(run):
+    rps = _metric("frontend-proxy", "rps", 18.8, 7.7)
+    p95 = _metric("frontend-proxy", "latency_p95", 3468.0, 4974.0)  # fell
+    t = _ev("trace:abc/span:GET", "frontend-proxy ERROR HTTP 504")
+    _healthy(run).metrics("rps", rps).metrics("latency_p95", p95).traces(t)
+    d = assess(_surge_d([rps["id"], t["id"], p95["id"]]), run.log)
+    assert (d["category"], d["decision"]) == ("traffic_surge", "act")
