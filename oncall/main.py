@@ -99,6 +99,8 @@ def cmd_killswitch(args: argparse.Namespace) -> int:
         print("kill switch off" + ("" if was_on else " (it was not engaged)"))
     print(killswitch.status())
     return 0
+
+
 def cmd_run(args: argparse.Namespace) -> int:
     if args.offline:
         os.environ["TELEMETRY_BACKEND"] = "offline"
