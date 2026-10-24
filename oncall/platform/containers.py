@@ -30,6 +30,7 @@ BUSIEST_IN_SUMMARY = 3  # healthy containers with the most CPU/memory use
 # Healthy containers kept as evidence (the busiest); the rest are only counted,
 # which keeps the result small for the LLM's context.
 HEALTHY_EVIDENCE = 5
+HEALTHCHECK_UNHEALTHY = "healthcheck unhealthy"
 
 DOCKER_TIMEOUT_S = 15
 READ_ONLY_COMMANDS = ("ps", "inspect", "stats")
@@ -134,7 +135,7 @@ def parse_docker_time(value: str | None) -> datetime | None:
         return None
 
 
-def _describe(info: dict, stats: dict | None) -> dict:
+def describe_container(info: dict, stats: dict | None) -> dict:
     """Pick the fields we care about out of one `docker inspect` entry."""
     state = info.get("State") or {}
     labels = (info.get("Config") or {}).get("Labels") or {}
@@ -164,7 +165,7 @@ def _is_client(c: dict) -> bool:
     return (c["service"] or c["name"]) in CLIENT_SERVICES
 
 
-def _problems(c: dict, now: datetime) -> list[str]:
+def find_problems(c: dict, now: datetime) -> list[str]:
     """Reasons this container looks unhealthy; empty list means healthy.
 
     Clients (the load generator) are never unhealthy: their state and usage are
@@ -176,7 +177,7 @@ def _problems(c: dict, now: datetime) -> list[str]:
     if c["state"] != "running":
         problems.append(f"not running (state={c['state']}, exit_code={c['exit_code']})")
     if c["health"] == "unhealthy":
-        problems.append("healthcheck unhealthy")
+        problems.append(HEALTHCHECK_UNHEALTHY)
     if c["oom_killed"]:
         problems.append("OOM-killed")
     started = parse_docker_time(c["started_at"])
@@ -245,7 +246,7 @@ def check_containers(
     containers = []
     for info in infos:
         name = (info.get("Name") or "").lstrip("/")
-        c = _describe(info, stats_by_name.get(name))
+        c = describe_container(info, stats_by_name.get(name))
         if not (is_excluded(c["service"]) or is_excluded(c["name"])):
             containers.append(c)
 
@@ -268,7 +269,7 @@ def check_containers(
             [],
         )
 
-    rows = [(c, _problems(c, now)) for c in containers]
+    rows = [(c, find_problems(c, now)) for c in containers]
     # Flagged first, then the busiest, so CPU/memory pressure survives the
     # 20-item evidence cap even though it is not flagged.
     rows.sort(key=lambda row: (not row[1], -_busy(row[0]), row[0]["name"]))
