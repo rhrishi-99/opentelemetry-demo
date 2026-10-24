@@ -89,6 +89,18 @@ def cmd_watch(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_killswitch(args: argparse.Namespace) -> int:
+    from oncall.safety import killswitch
+
+    if args.state == "on":
+        print(f"kill switch ENGAGED: {killswitch.engage()} (no action can run)")
+    elif args.state == "off":
+        was_on = killswitch.disengage()
+        print("kill switch off" + ("" if was_on else " (it was not engaged)"))
+    print(killswitch.status())
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     if hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(errors="replace")
@@ -106,6 +118,10 @@ def main(argv: list[str] | None = None) -> int:
     w.add_argument("--poll-s", type=int, default=None, help="seconds between checks")
     w.add_argument("--offline", metavar="SCENARIO", default=None)
     w.set_defaults(func=cmd_watch)
+
+    ks = sub.add_parser("killswitch", help="block every action (on), allow (off)")
+    ks.add_argument("state", choices=["on", "off", "status"])
+    ks.set_defaults(func=cmd_killswitch)
 
     args = parser.parse_args(argv)
     return args.func(args)

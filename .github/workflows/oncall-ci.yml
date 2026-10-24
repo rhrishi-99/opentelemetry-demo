@@ -114,6 +114,19 @@ jobs:
             echo "$hits"
             exit 1
           fi
+      - name: Only the executor imports the Action API
+        run: |
+          # Stricter than the step above: inside oncall/safety/ only executor.py may call
+          # action_api, after the kill switch and human approval.
+          hits=$(grep -rlE 'oncall\.safety\.action_api|from oncall\.safety import .*\baction_api\b' oncall/ 2>/dev/null \
+            | grep -vxE 'oncall/safety/executor\.py|oncall/safety/action_api\.py' \
+            | grep -v '^oncall/tests/safety/' \
+            | grep -v '/__pycache__/' || true)
+          if [ -n "$hits" ]; then
+            echo "::error::Only oncall/safety/executor.py may import the Action API:"
+            echo "$hits"
+            exit 1
+          fi
       - name: No committed secrets
         run: |
           # Key shapes: OpenAI-style and Anthropic-style keys, AWS access key IDs, GitHub personal tokens.
