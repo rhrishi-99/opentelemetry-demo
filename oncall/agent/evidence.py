@@ -3,6 +3,7 @@
 import re
 
 from oncall.agent.runlog import RunLog
+from oncall.config import COMPONENT_ALIASES
 from oncall.models import Diagnosis, Evidence
 
 MAX_REASONING_CHARS = 800
@@ -14,6 +15,12 @@ CITED_ID = re.compile(r"\[([a-z]+:[^\]]+)\]")
 SENTENCE_END = re.compile(r"(?<=[.!?])\s+")
 # A number such as 0.31, 3521 or 12.5 (a trailing "%" is read separately).
 NUMBER = re.compile(r"(?<![\w.])(\d+(?:\.\d+)?)(%?)")
+
+
+def _references(text: str, name: str) -> bool:
+    # Match aliases as whole tokens so "redis" does not match "predispatch".
+    pattern = rf"(?<![A-Za-z0-9]){re.escape(name)}(?![A-Za-z0-9])"
+    return re.search(pattern, text, re.IGNORECASE) is not None
 
 
 def tool_of(evidence_id: str) -> str:
@@ -35,6 +42,27 @@ def service_of(evidence: Evidence) -> str | None:
     if kind == "trace":
         return text.split(" ", 1)[0] or None
     return None
+
+
+def supports_component(evidence: Evidence, component: str) -> bool:
+    """Whether evidence names the component directly or through a configured alias."""
+    service = service_of(evidence)
+    if service == component:
+        return True
+
+    aliases = {component}
+    for canonical, names in COMPONENT_ALIASES.items():
+        group = {canonical, *names}
+        if component in group:
+            aliases.update(group)
+
+    text = evidence.get("text") or ""
+    return any(_references(text, name) for name in aliases)
+
+
+def _split_citations(value: str) -> list[str]:
+    """Read legacy comma-separated ids while returning each citation separately."""
+    return [item.strip() for item in value.split(",") if item.strip()]
 
 
 def salvage(evidence_id: str, index: dict[str, Evidence]) -> str | None:
@@ -85,15 +113,20 @@ def _clean_reasoning(
 ) -> str:
     kept = []
     for sentence in (s for s in SENTENCE_END.split(reasoning) if s.strip()):
-        cited = CITED_ID.findall(sentence)
+        cited = [
+            item
+            for group in CITED_ID.findall(sentence)
+            for item in _split_citations(group)
+        ]
         fixed = {c: salvage(c, index) for c in cited}
         unknown = [c for c, real in fixed.items() if real is None]
         if unknown:
             problems.append(f"removed reasoning sentence citing unknown ids {unknown}")
             continue
-        for cited_id, real in fixed.items():
-            if real != cited_id:
-                sentence = sentence.replace(f"[{cited_id}]", f"[{real}]")
+        for group in CITED_ID.findall(sentence):
+            citations = _split_citations(group)
+            repaired = " ".join(f"[{fixed[cited_id]}]" for cited_id in citations)
+            sentence = sentence.replace(f"[{group}]", repaired, 1)
         problem = _check_numbers(sentence, list(fixed.values()), index)
         if problem:
             problems.append(problem)
@@ -108,16 +141,17 @@ def validate(d: Diagnosis, run: RunLog) -> tuple[Diagnosis, list[str]]:
     out: Diagnosis = {**d, "alternatives": list(d["alternatives"])}
 
     ids: list[str] = []
-    for cited in d["evidence_ids"]:
-        real = salvage(cited, index)
-        if real is None:
-            problems.append(f"dropped evidence id not in run log: {cited[:120]}")
-        elif real != cited:
-            problems.append(
-                f"repaired malformed evidence id: {cited[:60]}... -> {real}"
-            )
-        if real is not None and real not in ids:
-            ids.append(real)
+    for cited_group in d["evidence_ids"]:
+        for cited in _split_citations(cited_group):
+            real = salvage(cited, index)
+            if real is None:
+                problems.append(f"dropped evidence id not in run log: {cited[:120]}")
+            elif real != cited:
+                problems.append(
+                    f"repaired malformed evidence id: {cited[:60]}... -> {real}"
+                )
+            if real is not None and real not in ids:
+                ids.append(real)
     out["evidence_ids"] = ids
     out["reasoning"] = _clean_reasoning(d["reasoning"], index, problems)
 
@@ -128,9 +162,9 @@ def validate(d: Diagnosis, run: RunLog) -> tuple[Diagnosis, list[str]]:
         return out, problems
 
     if out["component"]:
-        own = [i for i in ids if service_of(index[i]) == out["component"]]
+        own = [i for i in ids if supports_component(index[i], out["component"])]
         tools = {tool_of(i) for i in own}
-        if len(own) < 2 or len(tools) < 2:
+        if len(tools) < 2:
             out["confidence"] = round(out["confidence"] * THIN_EVIDENCE_FACTOR, 3)
             problems.append(
                 f"thin evidence for {out['component']}: {len(own)} items from "
