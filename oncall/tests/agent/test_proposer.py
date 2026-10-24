@@ -115,7 +115,24 @@ def test_llm_cannot_override_the_fixed_action_and_bad_text_is_rejected(tmp_path)
         _diagnosis(), run, PlannerLLM(_proposal_text(action="restart_service"))
     )
     assert proposal is not None and proposal["action"] == "disable_failure_flags"
-    assert propose(_diagnosis(), run, PlannerLLM("not json")) is None
+    fallback = propose(_diagnosis(), run, PlannerLLM("not json"))
+    assert fallback is not None and fallback["action"] == "disable_failure_flags"
+    assert fallback["reason"] == (
+        "app_error on cart: disable_failure_flags is the allowlisted remedy "
+        "for this category"
+    )
+
+
+def test_llm_failure_falls_back_to_a_template_reason(tmp_path):
+    class DownLLM:
+        def chat(self, messages, tools):
+            raise RuntimeError("429 rate limited")
+
+    proposal = propose(_diagnosis(), _run(tmp_path), DownLLM())
+    assert proposal is not None
+    assert proposal["reason"].startswith("app_error on cart: disable_failure_flags")
+    assert proposal["expected_effect"] == "cart recovers after disable_failure_flags"
+    assert propose(_diagnosis(decision="escalate"), _run(tmp_path), DownLLM()) is None
 
 
 def test_traffic_surge_requires_a_known_user_count(tmp_path):

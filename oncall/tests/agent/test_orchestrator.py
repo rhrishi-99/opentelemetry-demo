@@ -1,7 +1,7 @@
 """Tests for the three-agent orchestrator with typed hand-offs (F28)."""
 
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 

@@ -8,6 +8,7 @@ import pytest
 from oncall.agent.runlog import RunLog
 from oncall.config import Settings
 from oncall.safety import executor, killswitch
+from oncall.safety.actionlog import read_action_log
 from oncall.safety.executor import execute, to_request
 from oncall.tests.safety.test_approval import PROPOSAL
 
@@ -100,7 +101,7 @@ def test_rejection_blocks(env):
     result = execute(PROPOSAL, run, dry_run=False, approval=NO, settings=settings)
     assert result["executed"] is False
     assert result["allowed"] is True
-    assert "not approved by tester: not convinced" in result["detail"]
+    assert "rejected by tester: not convinced" in result["detail"]
     api.assert_not_called()
 
 
@@ -143,7 +144,7 @@ def test_kill_switch_engaged_after_approval_still_blocks(env):
     with mock.patch.object(executor, "request_approval", approve_then_engage):
         result = execute(PROPOSAL, run, dry_run=False, settings=settings)
     assert result["executed"] is False
-    assert result["detail"] == "kill switch engaged after approval"
+    assert result["detail"] == "blocked: kill switch engaged after approval"
     api.assert_not_called()
 
 
@@ -333,3 +334,23 @@ DIAGNOSIS_FOR_VERIFY = {
     "decision": "act",
     "reasoning": "x",
 }
+
+
+def test_every_outcome_the_api_never_saw_is_in_actions_jsonl(env):
+    settings, run, api = env
+    execute(PROPOSAL, run, dry_run=False, approval=NO, settings=settings)
+    killswitch.engage(settings)
+    execute(PROPOSAL, run, dry_run=False, approval=YES, settings=settings)
+    killswitch.disengage(settings)
+    execute(PROPOSAL, run, dry_run=True, approval=YES, settings=settings)
+    execute(PROPOSAL, run, dry_run=False, approval=YES, settings=settings)
+
+    records = read_action_log(Path(settings.RUNS_DIR) / "actions.jsonl", run_id="r1")
+    assert [r["detail"].split(":")[0] for r in records] == [
+        "rejected by tester",
+        "blocked",
+        "[DRY RUN] would restart_service cart {}",
+    ]
+    assert all(r["executed"] is False and r["action_id"] for r in records)
+    assert [r["dry_run"] for r in records] == [False, False, True]
+    api.assert_called_once()
