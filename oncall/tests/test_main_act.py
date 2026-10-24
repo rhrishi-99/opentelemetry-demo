@@ -109,6 +109,6 @@ def test_not_allowlisted_target_is_blocked(env, monkeypatch):
     _, api = env
     monkeypatch.setattr("builtins.input", lambda prompt: "yes")
     monkeypatch.setattr(verify_mod, "verify", _verified("not_recovered_escalated"))
-    args = ["act", "--action", "start_service", "--target", "flagd", "--execute"]
+    args = ["act", "--action", "start_service", "--target", "prometheus", "--execute"]
     assert cli.main(args) == 1
     api.assert_not_called()
