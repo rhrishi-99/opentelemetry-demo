@@ -89,6 +89,28 @@ def cmd_watch(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_run(args: argparse.Namespace) -> int:
+    if args.offline:
+        os.environ["TELEMETRY_BACKEND"] = "offline"
+        os.environ["OFFLINE_SCENARIO"] = args.offline
+
+    from oncall.agent.orchestrator import run_incident
+    from oncall.config import load_settings
+
+    settings = load_settings()
+    alert = _manual_alert(args.service, args.description)
+    execution = run_incident(
+        alert,
+        channel=args.channel,
+        dry_run=not args.execute,
+        settings=settings,
+    )
+    print(f"run_id:     {execution['investigation']['run_id']}")
+    print(f"status:     {execution['status']}")
+    print(f"report:     {execution['report_path']}")
+    return 0 if execution["status"] in ("success", "no_action") else 1
+
+
 def main(argv: list[str] | None = None) -> int:
     if hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(errors="replace")
@@ -106,6 +128,29 @@ def main(argv: list[str] | None = None) -> int:
     w.add_argument("--poll-s", type=int, default=None, help="seconds between checks")
     w.add_argument("--offline", metavar="SCENARIO", default=None)
     w.set_defaults(func=cmd_watch)
+
+    r = sub.add_parser("run", help="run full remediation orchestrator on an incident")
+    r.add_argument("--description", required=True, help="incident description")
+    r.add_argument("--service", default=None, help="target service name")
+    r.add_argument(
+        "--execute",
+        action="store_true",
+        default=False,
+        help="execute approved actions (default is dry-run)",
+    )
+    r.add_argument(
+        "--channel",
+        choices=["cli", "ui"],
+        default="cli",
+        help="approval channel (cli or ui)",
+    )
+    r.add_argument(
+        "--offline",
+        metavar="SCENARIO",
+        default=None,
+        help="run in offline mode with scenario fixture",
+    )
+    r.set_defaults(func=cmd_run)
 
     args = parser.parse_args(argv)
     return args.func(args)
