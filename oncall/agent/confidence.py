@@ -32,6 +32,10 @@ METRIC_TEXT = re.compile(
 # container_health evidence usage: "cpu=12.5% of one core" / "mem=40.0% of limit".
 USAGE = re.compile(r"(?P<kind>cpu|mem)=(?P<pct>[\d.]+)% of (?P<of>limit|one core)")
 CONTAINER_FAULTS = ("not running", "restarted", "OOM-killed", "healthcheck unhealthy")
+# A traffic surge counts only at the entry points, against an existing baseline.
+SURGE_SERVICES = frozenset({"frontend", "frontend-proxy"})
+SURGE_FACTOR = 2.0
+SURGE_MIN_RPS = 5.0
 
 
 @dataclass
@@ -45,6 +49,10 @@ class Signals:
     usage: dict[str, list[dict[str, float]]] = field(default_factory=dict)
     triage: set[str] = field(default_factory=set)
     trace_or_log: set[str] = field(default_factory=set)
+    # rps on an entry service: surged vs its baseline, or no baseline to compare.
+    surges: dict[str, list[str]] = field(default_factory=dict)
+    surge_no_baseline: set[str] = field(default_factory=set)
+    entry_latency_rise: set[str] = field(default_factory=set)
 
     def unhealthy(self) -> set[str]:
         return {
@@ -56,10 +64,28 @@ class Signals:
 
 def _metric_signal(text: str, signals: Signals, error_floor: float, p95_floor: float):
     m = METRIC_TEXT.match(text)
-    if not m or m["metric"] not in ("error_rate", "latency_p95"):
+    if not m or m["metric"] not in ("error_rate", "latency_p95", "rps"):
         return
     service = m["key"].split("/", 1)[0]
     now = float(m["now"])
+    if m["metric"] == "rps":
+        if service not in SURGE_SERVICES:
+            return
+        if m["base"] is None:
+            if now > 0:
+                signals.surge_no_baseline.add(service)
+        elif now >= SURGE_FACTOR * float(m["base"]) and now - float(m["base"]) >= (
+            SURGE_MIN_RPS
+        ):
+            signals.surges.setdefault(service, []).append(text)
+        return
+    if (
+        m["metric"] == "latency_p95"
+        and service in SURGE_SERVICES
+        and m["base"] is not None
+        and now > float(m["base"])
+    ):
+        signals.entry_latency_rise.add(service)
     if m["base"] is None:
         if now > 0:
             signals.no_baseline.setdefault(service, []).append(text)
@@ -163,6 +189,17 @@ def assess(d: Diagnosis, run: RunLog) -> Diagnosis:
     out: Diagnosis = {**d}
     notes: list[str] = []
     unhealthy = signals.unhealthy()
+    index = run.evidence_index()
+    cited = [index[i] for i in out["evidence_ids"] if i in index]
+    # A traffic surge is a regression only for a traffic_surge diagnosis that
+    # cites the entry service's rps evidence.
+    surge_rps = {
+        service_of(e) for e in cited if e["id"].startswith("metric:rps:")
+    } & SURGE_SERVICES
+    surging = surge_rps & set(signals.surges)
+    no_surge_baseline = (surge_rps & signals.surge_no_baseline) - surging
+    if out["category"] == "traffic_surge":
+        unhealthy |= surging | no_surge_baseline
 
     full_triage = FULL_TRIAGE <= signals.triage
     if full_triage and not unhealthy:
@@ -194,9 +231,14 @@ def assess(d: Diagnosis, run: RunLog) -> Diagnosis:
         )
 
     component = out["component"]
-    index = run.evidence_index()
-    cited = [index[i] for i in out["evidence_ids"] if i in index]
     own = [e for e in cited if component and supports_component(e, component)]
+    surge = out["category"] == "traffic_surge" and bool(surging)
+    # For a surge, a cited p95 rise on an entry service is the second signal.
+    surge_latency = surge and any(
+        e["id"].startswith("metric:latency_p95:")
+        and service_of(e) in signals.entry_latency_rise
+        for e in cited
+    )
 
     if (
         component in signals.container_faults
@@ -205,8 +247,10 @@ def assess(d: Diagnosis, run: RunLog) -> Diagnosis:
     ):
         confidence = min(confidence + 0.1, MAX_CONFIDENCE)
         notes.append("container and trace/log signals agree: +0.1")
-    if own and len({tool_of(e["id"]) for e in own}) == 1:
+    if own and len({tool_of(e["id"]) for e in own}) == 1 and not surge_latency:
         cap(0.55, "evidence from one tool only")
+    if out["category"] == "traffic_surge" and no_surge_baseline:
+        cap(0.5, f"no rps baseline for {', '.join(sorted(no_surge_baseline))}")
     if component and len(own) < 2:
         cap(0.5, f"fewer than 2 evidence items for {component}")
     faulted = {s for s in signals.container_faults if s not in CLIENT_SERVICES}
@@ -225,7 +269,11 @@ def assess(d: Diagnosis, run: RunLog) -> Diagnosis:
             cap(0.3, f"no {kind} limit hit or rise for {component}")
     has_regression = bool(
         component
-        and (component in signals.regressions or component in signals.container_faults)
+        and (
+            component in signals.regressions
+            or component in signals.container_faults
+            or (surge and component in SURGE_SERVICES)
+        )
     )
     if component and not has_regression:
         notes.append(f"no regression signal for {component}: act not allowed")
