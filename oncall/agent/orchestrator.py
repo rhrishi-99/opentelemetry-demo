@@ -515,6 +515,7 @@ def run_incident(
                 "from": "planner",
                 "to": "human_gate",
                 "summary": f"Proposed {proposal['action']} on {proposal['target']} ({proposal['reason']})",
+                "proposal": proposal,
             },
         )
         approval = human_gate.request_approval(

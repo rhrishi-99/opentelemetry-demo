@@ -2,6 +2,7 @@ import json
 import os
 from datetime import UTC, datetime
 from pathlib import Path
+from unittest.mock import MagicMock
 
 import httpx
 import pytest
@@ -401,3 +402,57 @@ def test_confidence_notes_are_split_and_reworded():
         "decision lowered: act → escalate",
     ]
     assert summary.confidence_notes("plain") == ("plain", [])
+
+
+def test_run_job_uses_the_orchestrator_on_the_ui_channel(tmp_path, monkeypatch):
+    runner = MagicMock()
+    monkeypatch.setattr(app, "run_incident", runner)
+    runlog = RunLog(run_id="j1", runs_dir=str(tmp_path))
+    alert = {"description": "x"}
+    app.run_job(alert, runlog, dry_run=False)
+    runner.assert_called_once_with(alert, dry_run=False, channel="ui", runlog=runlog)
+
+
+def test_run_job_crash_is_logged_and_still_reported(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    runlog = RunLog(run_id="j2", runs_dir=str(tmp_path / "runs"))
+    alert = {
+        "id": "a",
+        "ts": "",
+        "service": None,
+        "signal": "manual",
+        "value": None,
+        "threshold": None,
+        "description": "x",
+        "source": "manual",
+    }
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("detective exploded")
+
+    app.run_job(alert, runlog, dry_run=True, runner=boom)
+    errors = runlog.events("error")
+    assert errors[0]["where"] == "ui"
+    assert errors[0]["error"] == "RuntimeError: detective exploded"
+    assert [e for e in runlog.events("decision") if e.get("stage") == "report"]
+
+
+def test_awaiting_approval_until_the_gate_hands_off():
+    to_gate = {"event": "handoff", "from": "planner", "to": "human_gate"}
+    back = {"event": "handoff", "from": "human_gate", "to": "operator"}
+    assert app.awaiting_approval([to_gate])
+    assert not app.awaiting_approval([to_gate, back])
+    assert not app.awaiting_approval([{"event": "handoff", "to": "operator"}])
+
+
+def test_crashed_run_shows_a_red_error(replay, tmp_path):
+    RunLog(run_id="r1", runs_dir=str(tmp_path)).log(
+        "error", where="ui", error="RuntimeError: detective exploded"
+    )
+    at = AppTest.from_file(APP, default_timeout=30)
+    at.session_state["active_run_id"] = "r1"
+    at.run()
+    assert not at.exception
+    assert any(
+        "Run failed: RuntimeError: detective exploded" in e.value for e in at.error
+    )

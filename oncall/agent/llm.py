@@ -18,7 +18,9 @@ from oncall.config import Settings, load_settings, secret
 
 PROVIDER_BASE_URLS = {"groq": "https://api.groq.com/openai/v1"}
 DEFAULT_MODELS = {"groq": "openai/gpt-oss-120b"}
-TIMEOUT_S = 60
+TIMEOUT_S = 30
+# Most a single chat() may spend sleeping for pacing or rate limits.
+MAX_WAIT_PER_CALL_S = 45.0
 RETRY_STATUSES = (429, 500, 502, 503, 504)
 MAX_ATTEMPTS = 4
 MAX_WAIT_S = 60
@@ -264,6 +266,7 @@ class LLM:
         """
         skipped: list[str] = []
         rate_waits = 0
+        waited = 0.0
         last_429 = ""
         while True:
             live = [e for e in self.chain if e not in EXHAUSTED]
@@ -287,6 +290,14 @@ class LLM:
                 for i, e in enumerate(live)
             )
             if wait > 0:
+                if waited + wait > MAX_WAIT_PER_CALL_S:
+                    raise LLMError(
+                        f"LLM wait budget exceeded: would wait {waited + wait:.0f}s "
+                        f"(limit {MAX_WAIT_PER_CALL_S:.0f}s) for {endpoint.budget}",
+                        status=429,
+                        body=last_429,
+                    )
+                waited += wait
                 if self.cooldown.get(endpoint, 0.0) > now:
                     if rate_waits == MAX_RATE_RETRIES:
                         raise LLMError(
