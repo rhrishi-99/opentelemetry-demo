@@ -3,7 +3,7 @@ from pathlib import Path
 
 import pytest
 
-from oncall.agent import diagnosis, taxonomy
+from oncall.agent import diagnosis, prompts, taxonomy
 from oncall.agent.diagnosis import check, diagnose, escalate_unknown
 from oncall.agent.llm import LLMError, LLMReply
 from oncall.agent.loop import investigate_and_diagnose
@@ -216,3 +216,12 @@ FORBIDDEN = re.compile(r"feature[_. ]?flag|flag-?d|scenario[- ]?\d", re.IGNORECA
 def test_no_flag_or_scenario_text(name):
     text = (AGENT_DIR / name).read_text(encoding="utf-8")
     assert not FORBIDDEN.search(text)
+
+
+def test_investigate_prompt_limits_repeated_tool_calls():
+    text = " ".join(prompts.INVESTIGATE.split())
+    assert "Never call the same tool for the same service more than twice." in text
+    assert (
+        "If a tool returns nothing twice, move on to a different tool or finish."
+        in text
+    )

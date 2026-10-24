@@ -48,7 +48,9 @@ as the candidate is supported by at least 2 evidence items from at least 2 \
 different tools. If TRIAGE shows no regression anywhere (error rates and p95 \
 latency at or below baseline, every container running), the system is healthy: \
 call finish right away and say so; do not hunt for a cause. Busy CPU on a \
-container without a CPU limit is normal, not a regression."""
+container without a CPU limit is normal, not a regression.
+Never call the same tool for the same service more than twice. If a tool \
+returns nothing twice, move on to a different tool or finish."""
 
 DIAGNOSE = """\
 You are the on-call SRE for the Astronomy Shop. The investigation is over. Turn it into a structured diagnosis by calling \
