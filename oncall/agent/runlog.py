@@ -25,6 +25,7 @@ VALID_EVENTS = {
     "tool_result",
     "decision",
     "action",
+    "handoff",
     "error",
     "finish",
 }
