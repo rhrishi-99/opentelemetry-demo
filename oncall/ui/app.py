@@ -10,6 +10,7 @@ import os
 import re
 import sys
 import threading
+import time
 import uuid
 from datetime import UTC, datetime
 from pathlib import Path
@@ -62,6 +63,20 @@ REGRESSION_FACTORS = {
     "rps": (2.0, "rps"),
 }
 FLAGGED = " | FLAGGED: "
+ERROR_FLOOR = 0.02
+# Below this, p95 doubling is noise on fast services (shipping 8 -> 25 ms idle).
+P95_FLOOR_MS = 100.0
+# Traffic surges only count at the entry points.
+SURGE_SERVICES = ("frontend", "frontend-proxy")
+AUTO_LABEL = "Auto-detect (prototype — full detector is F14)"
+AUTO_INTERVAL_S = 20
+AUTO_COOLDOWN_S = 600
+# metric -> (alert wording, value format)
+SIGNALS = {
+    "error_rate": ("error rate", "{:.2f}"),
+    "latency_p95": ("p95 latency", "{:.0f} ms"),
+    "rps": ("traffic", "{:.2f} rps"),
+}
 
 
 def fetch_metrics(backend) -> tuple[dict[str, dict], int | None]:
@@ -96,19 +111,32 @@ def fetch_metrics(backend) -> tuple[dict[str, dict], int | None]:
     return values, used
 
 
-def regressions(values: dict, error_floor: float) -> list[str]:
-    """Which of a service's metrics regressed against an existing baseline."""
-    found = []
+def regressed(
+    values: dict, error_floor: float, service: str | None = None
+) -> dict[str, str]:
+    """{metric: label} for a service's metrics that regressed against a baseline."""
+    found = {}
     for metric, (factor, label) in REGRESSION_FACTORS.items():
+        if metric == "rps" and service is not None and service not in SURGE_SERVICES:
+            continue
         now, base = values.get(metric, (None, None))
         if now is None or base is None:
             continue
-        floor = error_floor if metric == "error_rate" else 0.0
+        floor = {"error_rate": error_floor, "latency_p95": P95_FLOOR_MS}.get(
+            metric, 0.0
+        )
         if base > 0 and now >= factor * base and now >= floor:
-            found.append(f"{label} {now / base:.1f}x")
+            found[metric] = f"{label} {now / base:.1f}x"
         elif base == 0 and metric == "error_rate" and now >= error_floor:
-            found.append(f"{label} new")
+            found[metric] = f"{label} new"
     return found
+
+
+def regressions(
+    values: dict, error_floor: float, service: str | None = None
+) -> list[str]:
+    """Which of a service's metrics regressed against an existing baseline."""
+    return list(regressed(values, error_floor, service).values())
 
 
 def health_rows(
@@ -137,7 +165,10 @@ def health_rows(
         if r["service"] in EXCLUDED_SERVICES:
             continue
         r["client"] = r["service"] in CLIENT_SERVICES
-        r["regressions"] = [] if r["client"] else regressions(r["metrics"], error_floor)
+        r["regressed"] = (
+            {} if r["client"] else regressed(r["metrics"], error_floor, r["service"])
+        )
+        r["regressions"] = list(r["regressed"].values())
         r["unhealthy"] = not r["client"] and (
             r["status"].startswith("unhealthy") or bool(r["regressions"])
         )
@@ -298,20 +329,83 @@ def _pair(row: dict, metric: str, fmt) -> str:
     return f"{fmt(now)} / {fmt(base)}"
 
 
-def render_health(settings: Settings) -> None:
+def refresh_health(settings: Settings) -> None:
+    with st.spinner("Checking containers, errors, latency and traffic…"):
+        try:
+            (values, offset), error = fetch_metrics(get_backend()), None
+        except BackendError as exc:
+            (values, offset), error = ({}, None), str(exc)
+        st.session_state.health = (
+            all_container_health(settings),
+            values,
+            offset,
+            error,
+        )
+        st.session_state.health_at = time.time()
+
+
+def alert_signal(r: dict) -> tuple[str, str]:
+    """(banner text, alert description) for an unhealthy row's first signal."""
+    service = r["service"]
+    if r["status"].startswith("unhealthy"):
+        problems = r["status"].removeprefix("unhealthy: ")
+        return f"{service} container {problems}", f"{service} container {problems}"
+    metric = next(iter(r["regressed"]))
+    name, fmt = SIGNALS[metric]
+    now, base = r["metrics"][metric]
+    detail = f"{fmt.format(now)} vs baseline {fmt.format(base)}"
+    return f"{service} {name} {detail}", f"{name} on {service} {detail}"
+
+
+def primary(unhealthy: list[dict]) -> dict:
+    """The row to investigate: a container problem first, else the worst ratio."""
+
+    def key(r: dict) -> tuple:
+        ratios = [
+            now / base if base else float("inf")
+            for metric, (now, base) in r["metrics"].items()
+            if metric in r["regressed"]
+        ]
+        return (not r["status"].startswith("unhealthy"), -max(ratios, default=0))
+
+    return min(unhealthy, key=key)
+
+
+def should_auto_run(services: frozenset, last: tuple | None, now_s: float) -> bool:
+    if not services:
+        return False
+    if last is None:
+        return True
+    at, previous = last
+    return previous != services or now_s - at >= AUTO_COOLDOWN_S
+
+
+def auto_detect(settings: Settings, rows: list[dict], running: bool) -> None:
+    unhealthy = [r for r in rows if r["unhealthy"]]
+    if unhealthy and st.session_state.get("auto_banner"):
+        st.error(f"ALERT: {st.session_state.auto_banner} — starting investigation")
+    services = frozenset(r["service"] for r in unhealthy)
+    now_s = time.time()
+    if running or not should_auto_run(
+        services, st.session_state.get("auto_last"), now_s
+    ):
+        return
+    target = primary(unhealthy)
+    banner, description = alert_signal(target)
+    others = sorted(services - {target["service"]})
+    if others:
+        description += f"; also unhealthy: {', '.join(others)}"
+    st.session_state.auto_last = (now_s, services)
+    st.session_state.auto_banner = banner
+    start_run(settings, description, target["service"])
+
+
+def health_panel(settings: Settings, auto: bool, interval: int, thread) -> None:
     st.subheader("System health")
-    if st.button("Refresh"):
-        with st.spinner("Checking containers, errors, latency and traffic…"):
-            try:
-                (values, offset), error = fetch_metrics(get_backend()), None
-            except BackendError as exc:
-                (values, offset), error = ({}, None), str(exc)
-            st.session_state.health = (
-                all_container_health(settings),
-                values,
-                offset,
-                error,
-            )
+    if st.button("Refresh") or (
+        auto and time.time() - st.session_state.get("health_at", 0) >= interval - 1
+    ):
+        refresh_health(settings)
     if "health" not in st.session_state:
         st.caption("Press Refresh to check containers, errors, latency and traffic.")
         return
@@ -325,10 +419,12 @@ def render_health(settings: Settings) -> None:
         st.warning(f"container_health: {containers['error']}")
     if error:
         st.warning(f"metrics: {error}")
-    rows = health_rows(containers, metrics, settings.ALERT_ERROR_RATE)
+    rows = health_rows(containers, metrics, ERROR_FLOOR)
     if not rows:
         st.info("No container or metric data.")
         return
+    if auto:
+        auto_detect(settings, rows, thread is not None and thread.is_alive())
     df = pd.DataFrame(
         [
             {
@@ -354,6 +450,7 @@ def render_health(settings: Settings) -> None:
         return [css] * len(line)
 
     st.dataframe(df.style.apply(style, axis=1), hide_index=True, width="stretch")
+    st.caption(f"checked {datetime.fromtimestamp(st.session_state.health_at):%H:%M:%S}")
 
 
 def start_run(settings: Settings, description: str, service: str | None) -> None:
@@ -492,6 +589,23 @@ def live_view(settings: Settings, run_id: str, thread: threading.Thread) -> None
         st.rerun()
 
 
+def render_auto_controls() -> tuple[bool, int]:
+    st.sidebar.header(AUTO_LABEL)
+    auto = st.sidebar.toggle("Auto-detect", value=True)
+    interval = int(
+        st.sidebar.number_input(
+            "Interval (s)", min_value=5, value=AUTO_INTERVAL_S, step=5
+        )
+    )
+    last = st.session_state.get("auto_last")
+    st.sidebar.caption(
+        f"last auto-run: {datetime.fromtimestamp(last[0]):%H:%M:%S}"
+        if last
+        else "last auto-run: never"
+    )
+    return auto, interval
+
+
 def render_sidebar(settings: Settings) -> None:
     st.sidebar.header("Past runs")
     runs = list_runs(settings.RUNS_DIR)
@@ -506,11 +620,14 @@ def main() -> None:
     st.set_page_config(page_title="AI On-Call Engineer", layout="wide")
     settings, endpoints = configure()
     services = render_header(settings, endpoints)
+    auto, interval = render_auto_controls()
     render_sidebar(settings)
-    render_health(settings)
 
     live_id, thread = st.session_state.get("live", (None, None))
     running = thread is not None and thread.is_alive()
+    st.fragment(health_panel, run_every=interval if auto else None)(
+        settings, auto, interval, thread
+    )
     render_alert_form(settings, services, running)
 
     run_id = st.session_state.get("view_run")

@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+import time
 from datetime import UTC, datetime
 from typing import Any, Literal
 
@@ -52,6 +53,10 @@ MAX_GROUPS = 10
 MAX_LINE_CHARS = 120
 MAX_EVIDENCE_TEXT = 200
 UNATTRIBUTED = "unattributed"
+SHIPS_LOGS_TTL_S = 600
+
+# service -> (has any log docs, monotonic time checked)
+_ships_logs: dict[str, tuple[bool, float]] = {}
 
 
 def normalize_message(msg: str) -> str:
@@ -184,6 +189,21 @@ def _extract_log_fields(hit: dict[str, Any]) -> tuple[str, str, str, str]:
     return str(service), message.strip(), str(lvl).lower(), str(ts)
 
 
+def ships_logs(be: TelemetryBackend, service: str, since_min: int) -> bool | None:
+    """Whether a service has any log docs at any level (None if the check failed)."""
+    cached = _ships_logs.get(service)
+    if cached and time.monotonic() - cached[1] < SHIPS_LOGS_TTL_S:
+        return cached[0]
+    try:
+        found = bool(
+            be.logs_search(service=service, level=None, since_min=since_min, limit=1)
+        )
+    except Exception:  # noqa: BLE001
+        return None
+    _ships_logs[service] = (found, time.monotonic())
+    return found
+
+
 def _matches_level(log_level: str, min_level: str) -> bool:
     """Check if log_level satisfies min_level threshold."""
     min_rank = MIN_RANKS.get(min_level.lower(), 40)
@@ -250,6 +270,13 @@ def search_logs(
         return make_error("search_logs", query_params, f"{type(exc).__name__}: {exc}")
 
     if not raw_logs:
+        if service and ships_logs(be, service, since_min) is False:
+            summary = (
+                f"No logs are indexed for {service} at all in the last {since_min} min"
+                " — this service doesn't ship logs to OpenSearch; use traces/metrics"
+                " instead."
+            )
+            return make_result("search_logs", query_params, summary, [])
         summary = (
             f"No logs found for service='{service}' level>='{level}' in the last {since_min}m."
             if service
@@ -263,6 +290,7 @@ def search_logs(
 
     for entry in raw_logs:
         hit_service, hit_msg, hit_lvl, hit_ts = _extract_log_fields(entry)
+        _ships_logs[hit_service] = (True, time.monotonic())
 
         if is_excluded(hit_service) or not _matches_level(hit_lvl, level):
             continue

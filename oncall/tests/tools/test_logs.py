@@ -5,8 +5,10 @@ from pathlib import Path
 from unittest.mock import MagicMock
 
 import httpx
+import pytest
 
 from oncall.safety.exclusions import EXCLUDED_SERVICES
+from oncall.tools import logs as logs_module
 from oncall.tools.backends import BackendError, LiveBackend, OfflineBackend
 from oncall.tools.logs import (
     MAX_EVIDENCE_TEXT,
@@ -19,6 +21,13 @@ from oncall.tools.logs import (
     search_logs,
 )
 from oncall.tools.registry import TOOL_SCHEMAS, TOOLS
+
+
+@pytest.fixture(autouse=True)
+def clear_ships_logs_cache():
+    logs_module._ships_logs.clear()
+    yield
+    logs_module._ships_logs.clear()
 
 
 def test_tool_registered():
@@ -244,3 +253,66 @@ def test_summary_says_when_limit_was_reached():
         "limit reached"
         not in search_logs(limit=4, backend=_backend_returning(docs))["summary"]
     )
+
+
+def _probing_backend(with_logs: set[str]) -> MagicMock:
+    """Empty at the asked level; one doc at any level for services in with_logs."""
+    backend = MagicMock()
+
+    def logs_search(service, level, since_min, limit):
+        if level is None and service in with_logs:
+            return [{"resource": {"service.name": service}, "body": "ok"}]
+        return []
+
+    backend.logs_search.side_effect = logs_search
+    return backend
+
+
+def test_service_without_any_logs_says_so():
+    backend = _probing_backend(with_logs=set())
+    res = search_logs(service="payment", since_min=15, backend=backend)
+    assert res["ok"] is True and res["evidence"] == []
+    assert res["summary"] == (
+        "No logs are indexed for payment at all in the last 15 min — this service "
+        "doesn't ship logs to OpenSearch; use traces/metrics instead."
+    )
+    probe = backend.logs_search.call_args_list[-1].kwargs
+    assert probe["level"] is None and probe["limit"] == 1
+
+
+def test_service_with_logs_at_other_levels_keeps_plain_message():
+    res = search_logs(service="cart", backend=_probing_backend(with_logs={"cart"}))
+    assert res["ok"] is True
+    assert res["summary"].startswith("No logs found for service='cart'")
+
+
+def test_ships_logs_is_cached_for_ten_minutes(monkeypatch):
+    clock = [1000.0]
+    monkeypatch.setattr(logs_module.time, "monotonic", lambda: clock[0])
+    backend = _probing_backend(with_logs=set())
+    search_logs(service="payment", backend=backend)
+    search_logs(service="payment", backend=backend)
+    assert backend.logs_search.call_count == 3  # 2 searches + 1 probe
+
+    clock[0] += logs_module.SHIPS_LOGS_TTL_S
+    search_logs(service="payment", backend=backend)
+    assert backend.logs_search.call_count == 5  # cache expired: probed again
+
+
+def test_services_seen_in_results_skip_the_probe():
+    docs = [
+        {"severity": {"number": 17}, "resource": {"service.name": "cart"}, "body": "x"}
+    ]
+    search_logs(backend=_backend_returning(docs))
+    backend = _probing_backend(with_logs=set())
+    res = search_logs(service="cart", backend=backend)
+    assert backend.logs_search.call_count == 1
+    assert res["summary"].startswith("No logs found for service='cart'")
+
+
+def test_failed_probe_falls_back_to_plain_message():
+    backend = MagicMock()
+    backend.logs_search.side_effect = [[], BackendError("down")]
+    res = search_logs(service="payment", backend=backend)
+    assert res["ok"] is True
+    assert res["summary"].startswith("No logs found for service='payment'")
