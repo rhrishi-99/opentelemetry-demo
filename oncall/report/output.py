@@ -13,6 +13,7 @@ import jsonschema
 
 from oncall.agent.runlog import RunLog
 from oncall.models import Alert, Diagnosis
+from oncall.report import summary as incident_summary
 from oncall.report.adapter import to_official
 
 SCHEMA_PATH = Path(__file__).with_name("schema.json")
@@ -268,11 +269,35 @@ def finalise_report(
     return report, notes
 
 
-def to_markdown(report: dict) -> str:
+def summary_markdown(report: dict, run: RunLog) -> str:
+    """The incident summary block (oncall/report/summary.py) for a finished report."""
+    rc = report["root_cause"]
+    diagnosis = {
+        "component": rc["component"],
+        "category": rc["category"],
+        "cause": rc["description"],
+        "confidence": report["confidence"],
+        "decision": report["decision"],
+        "reasoning": report.get("reasoning") or "",
+        "affected_services": report["affected_services"],
+        "alternatives": report["alternatives"],
+        "evidence_ids": [e["id"] for e in report["evidence"]],
+    }
+    s = incident_summary.build_summary(
+        diagnosis,
+        run.events(),
+        run.evidence_index(),
+        verification=report.get("verification") or None,
+    )
+    return incident_summary.to_markdown(s)
+
+
+def to_markdown(report: dict, summary_md: str = "") -> str:
     rc = report["root_cause"]
     lines = [
         f"# Incident {report['incident_id']}",
         "",
+        *([summary_md] if summary_md else []),
         f"- Detected: {report['detected_at']}",
         (
             f"- Alert: {report['alert']['description']} "
@@ -319,7 +344,9 @@ def to_markdown(report: dict) -> str:
     return "\n".join(lines)
 
 
-def write(report: dict, out_dir: str | Path = "reports") -> tuple[Path, Path]:
+def write(
+    report: dict, out_dir: str | Path = "reports", summary_md: str = ""
+) -> tuple[Path, Path]:
     """reports/<incident_id>.json (must be valid) + reports/<incident_id>.md."""
     problems = validate(report)
     if problems:
@@ -331,7 +358,7 @@ def write(report: dict, out_dir: str | Path = "reports") -> tuple[Path, Path]:
     json_path.write_text(
         json.dumps(report, indent=2, ensure_ascii=False), encoding="utf-8"
     )
-    md_path.write_text(to_markdown(report), encoding="utf-8")
+    md_path.write_text(to_markdown(report, summary_md), encoding="utf-8")
     return json_path, md_path
 
 
@@ -344,7 +371,7 @@ def report_run(
 ) -> tuple[Path, Path]:
     """Finalise and write the run's report; record where it went in the run log."""
     report, notes = finalise_report(alert, diagnosis, run, **kwargs)
-    json_path, md_path = write(report, out_dir)
+    json_path, md_path = write(report, out_dir, summary_markdown(report, run))
     run.log(
         "decision",
         stage="report",

@@ -1,3 +1,4 @@
+import json
 import os
 from datetime import UTC, datetime
 from pathlib import Path
@@ -9,6 +10,7 @@ from streamlit.testing.v1 import AppTest
 
 from oncall.agent.runlog import RunLog
 from oncall.models import make_error, make_result
+from oncall.report import summary
 from oncall.safety.exclusions import EXCLUDED_SERVICES
 from oncall.ui import app
 
@@ -166,6 +168,111 @@ def test_list_runs_newest_first(tmp_path):
     assert app.list_runs(str(tmp_path)) == [new, old]
 
 
+def test_handoff_stages_light_only_when_a_stage_appears_in_handoff():
+    stages = app.handoff_stages(
+        [
+            {"event": "decision", "from_agent": "operator"},
+            {
+                "event": "handoff",
+                "from_agent": "detective",
+                "to_agent": "planner",
+            },
+            {"event": "handoff", "from": "human_gate", "to": "operator"},
+        ]
+    )
+    assert stages == {
+        "Detective": True,
+        "Planner": True,
+        "Human": True,
+        "Operator": True,
+    }
+    assert not any(app.handoff_stages([]).values())
+
+
+def test_planner_data_reads_plan_and_execution_handoff_payloads():
+    review = {
+        "challenges": [
+            {"hypothesis": "Bad baseline", "ruled_out": True, "evidence_ids": ["m1"]}
+        ],
+        "confidence_adjustment": 0,
+    }
+    proposal = {"action": "restart_service", "target": "cart"}
+    verification = {"recovered": True, "polls": 2}
+    events = [
+        {
+            "event": "handoff",
+            "to_agent": "human_gate",
+            "plan": {"review": review, "proposal": proposal},
+        },
+        {
+            "event": "handoff",
+            "to_agent": "report",
+            "execution": {"verification": verification},
+        },
+    ]
+    assert app._planner_data(events) == (review, proposal, verification)
+
+
+def test_write_approval_persists_human_decision_and_dry_run_by_default(tmp_path):
+    settings = app.Settings(RUNS_DIR=str(tmp_path))
+    path = app.write_approval(settings, "run-123", True, "Ada", "looks safe")
+    approval = json.loads(path.read_text(encoding="utf-8"))
+    assert path == tmp_path / "approvals" / "run-123.json"
+    assert approval == {
+        "approved": True,
+        "by": "Ada",
+        "ts": approval["ts"],
+        "comment": "looks safe",
+        "dry_run": True,
+    }
+    assert datetime.fromisoformat(approval["ts"]).tzinfo is not None
+    assert app._read_approval(settings, "run-123") == approval
+
+
+def test_write_approval_supports_rejection_and_real_execution_mode(tmp_path):
+    settings = app.Settings(RUNS_DIR=str(tmp_path))
+    path = app.write_approval(settings, "run-123", False, "Ada", dry_run=False)
+    approval = json.loads(path.read_text(encoding="utf-8"))
+    assert approval["approved"] is False
+    assert approval["dry_run"] is False
+
+
+def test_kill_switch_toggle_only_changes_the_configured_file(tmp_path):
+    path = tmp_path / "controls" / ".killswitch"
+    app._set_kill_switch(path, True)
+    assert path.is_file()
+    app._set_kill_switch(path, False)
+    assert not path.exists()
+
+
+def test_action_records_filter_by_run_and_scrub_flag_details(tmp_path):
+    action_log = tmp_path / "actions.jsonl"
+    action_log.write_text(
+        json.dumps(
+            {
+                "run_id": "run-1",
+                "action_id": "act-1",
+                "request": {"action": "restart_service"},
+                FLAG_KEY: "private",
+            }
+        )
+        + "\n"
+        + json.dumps({"run_id": "run-2", "action_id": "act-2"})
+        + "\n",
+        encoding="utf-8",
+    )
+    records = app.action_records(app.Settings(RUNS_DIR=str(tmp_path)), "run-1")
+    assert [record["action_id"] for record in records] == ["act-1"]
+    assert all(FLAG_KEY not in record for record in records)
+
+
+@pytest.mark.parametrize("run_id", ["../escape", "nested/run", "nested\\run", ".."])
+def test_approval_path_rejects_run_id_path_traversal(tmp_path, run_id):
+    settings = app.Settings(RUNS_DIR=str(tmp_path))
+    with pytest.raises(ValueError, match="Invalid run id"):
+        app.write_approval(settings, run_id, True, "Ada")
+
+
 @pytest.fixture
 def replay(tmp_path, monkeypatch):
     for key in ("TELEMETRY_BACKEND", "RUNS_DIR", "OFFLINE_SCENARIO"):
@@ -213,7 +320,7 @@ def replay(tmp_path, monkeypatch):
 
 def test_replays_a_past_run(replay):
     at = AppTest.from_file(APP, default_timeout=30)
-    at.session_state["view_run"] = "r1"
+    at.session_state["active_run_id"] = "r1"
     at.run()
     assert not at.exception
     texts = [t.value for t in at.text]
@@ -221,7 +328,15 @@ def test_replays_a_past_run(replay):
     assert "cart errors" in texts
     assert "GetCart ERROR connection refused" in texts
     assert any("ESCALATE" in m.value for m in at.markdown)
-    assert [w.value for w in at.warning] == ["Not found in this run's evidence index."]
+    assert "Not in this run's evidence." in texts
+    assert not at.warning
+    assert any(
+        "cart — application errors" in m.value and "ESCALATE" in m.value
+        for m in at.markdown
+    )
+    assert any("INCIDENT SUMMARY" in c.value for c in at.caption)
+    assert any(e.label == "Full agent narrative" for e in at.expander)
+    assert any(e.label.startswith("Investigation steps (1)") for e in at.expander)
     assert all(b.disabled for b in at.button if b.label in ("Approve", "Reject"))
     assert not any("never shown" in str(x.value) for x in at.json)
     assert any("users report errors" in b.label for b in at.sidebar.button)
@@ -259,3 +374,30 @@ def test_jaeger_v3_services(monkeypatch):
         "other",
     ]
     assert seen["url"] == "http://127.0.0.1:8080/jaeger/ui/api/v3/services"
+
+
+def test_auto_run_debounce_ignores_flapping_and_waits_after_failure():
+    seen = frozenset({"email", "cart", "checkout"})
+    cooldown = app.AUTO_COOLDOWN_S
+    assert app.should_auto_run(frozenset({"email"}), None, 0)
+    assert not app.should_auto_run(frozenset(), None, 0)
+    assert not app.should_auto_run(frozenset({"email", "cart"}), (0, seen), 60)
+    assert app.should_auto_run(frozenset({"email", "payment"}), (0, seen), 60)
+    assert not app.should_auto_run(
+        frozenset({"email", "payment"}), (0, seen), 60, failed=True
+    )
+    assert app.should_auto_run(frozenset({"email"}), (0, seen), cooldown, failed=True)
+
+
+def test_confidence_notes_are_split_and_reworded():
+    reasoning, notes = summary.confidence_notes(
+        "cause found [confidence: evidence from one tool only: cap 0.55; "
+        "no alternatives falsified: -0.1; decision act -> escalate]"
+    )
+    assert reasoning == "cause found"
+    assert [app.friendly_note(n) for n in notes] == [
+        "capped at 55%: evidence from one tool only",
+        "-10%: no alternatives falsified",
+        "decision lowered: act → escalate",
+    ]
+    assert summary.confidence_notes("plain") == ("plain", [])
