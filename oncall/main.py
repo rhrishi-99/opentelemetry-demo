@@ -51,6 +51,44 @@ def cmd_investigate(args: argparse.Namespace) -> int:
     return 0 if result["stopped"] in ("finish", "max_steps") else 1
 
 
+def cmd_watch(args: argparse.Namespace) -> int:
+    if args.offline:
+        os.environ["TELEMETRY_BACKEND"] = "offline"
+        os.environ["OFFLINE_SCENARIO"] = args.offline
+
+    from oncall.agent.loop import investigate_and_diagnose
+    from oncall.agent.runlog import RunLog
+    from oncall.config import load_settings
+    from oncall.platform.alert import watch
+    from oncall.report.output import report_run
+
+    def on_check(entry: dict) -> None:
+        found = entry.get("error") or f"{len(entry.get('alerts', []))} alert(s)"
+        fired = f" -> fired {entry['fired']}" if "fired" in entry else ""
+        print(f"[{entry['ts']}] {found}{fired}", flush=True)
+
+    def on_alert(alert: Alert) -> None:
+        print(f"ALERT {alert['id']}: {alert['description']}", flush=True)
+        runlog = RunLog(runs_dir=load_settings().RUNS_DIR)
+        result = investigate_and_diagnose(alert, runlog=runlog)
+        json_path, md_path = report_run(alert, result["diagnosis"], runlog)
+        d = result["diagnosis"]
+        print(
+            f"  run {result['run_id']}: stopped={result['stopped']}, "
+            f"component={d['component']}, category={d['category']}, "
+            f"confidence={d['confidence']:.2f}, decision={d['decision']}\n"
+            f"  run log: {runlog.path}\n"
+            f"  report:  {json_path} + {md_path.name}",
+            flush=True,
+        )
+
+    try:
+        watch(poll_s=args.poll_s, on_alert=on_alert, once=args.once, on_check=on_check)
+    except KeyboardInterrupt:
+        print("watch stopped")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     if hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(errors="replace")
@@ -62,6 +100,12 @@ def main(argv: list[str] | None = None) -> int:
     inv.add_argument("--description", required=True)
     inv.add_argument("--offline", metavar="SCENARIO", default=None)
     inv.set_defaults(func=cmd_investigate)
+
+    w = sub.add_parser("watch", help="watch for incidents and investigate them")
+    w.add_argument("--once", action="store_true", help="run one check and exit")
+    w.add_argument("--poll-s", type=int, default=None, help="seconds between checks")
+    w.add_argument("--offline", metavar="SCENARIO", default=None)
+    w.set_defaults(func=cmd_watch)
 
     args = parser.parse_args(argv)
     return args.func(args)
