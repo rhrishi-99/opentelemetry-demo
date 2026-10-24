@@ -13,6 +13,13 @@ SCHEMA = {
 }
 
 
+@pytest.fixture(autouse=True)
+def fresh_limits():
+    llm_mod.USAGE.clear()
+    yield
+    llm_mod.USAGE.clear()
+
+
 def settings(**kw) -> Settings:
     return Settings(LLM_PROVIDER="groq", LLM_API_KEY="test-key", **kw)
 
@@ -151,7 +158,7 @@ def test_rate_limit_waits_as_long_as_groq_asks(monkeypatch):
     )
     transport = FakeTransport((429, limited), (200, groq_response(content="ok")))
     assert LLM(settings(), transport).chat([], []).text == "ok"
-    assert waits == [pytest.approx(19.77)]
+    assert waits == [pytest.approx(19.27, abs=0.1)]
 
 
 def test_wait_is_capped():
@@ -228,12 +235,74 @@ def test_daily_quota_moves_to_next_endpoint_and_stays_skipped(chain):
     assert len(transport.requests) == 3
 
 
-def test_per_minute_429_is_retried_on_the_same_endpoint(chain):
+def test_per_minute_429_switches_to_the_next_key_without_waiting(chain, monkeypatch):
+    waits = []
+    monkeypatch.setattr(llm_mod.time, "sleep", waits.append)
     transport = FakeTransport((429, TPM_429), (200, groq_response(content="ok")))
     reply = LLM(chain, transport).chat([], [])
-    assert reply.model == "groq:openai/gpt-oss-120b"
-    assert [r[2]["model"] for r in transport.requests] == ["openai/gpt-oss-120b"] * 2
-    assert not llm_mod.EXHAUSTED
+    assert (reply.model, reply.key) == ("groq:openai/gpt-oss-20b", "KEY_B")
+    assert [r[1]["Authorization"] for r in transport.requests] == [
+        "Bearer key-a",
+        "Bearer key-b",
+    ]
+    assert waits == [] and not llm_mod.EXHAUSTED
+
+
+def test_extra_groq_keys_rotate_on_429(monkeypatch):
+    monkeypatch.setenv("GROQ_KEY_2", "key-2")
+    monkeypatch.setattr(llm_mod.time, "sleep", lambda s: None)
+    transport = FakeTransport(
+        (429, TPM_429),
+        (200, groq_response(content="from key 2")),
+        (200, groq_response(content="key 1 cooling, still key 2")),
+    )
+    llm = LLM(settings(), transport)
+    assert [e.key_env for e in llm.chain] == ["LLM_API_KEY", "GROQ_KEY_2"]
+    assert llm.chat([], []).key == "GROQ_KEY_2"
+    assert llm.chat([], []).key == "GROQ_KEY_2"
+    assert [r[1]["Authorization"] for r in transport.requests] == [
+        "Bearer test-key",
+        "Bearer key-2",
+        "Bearer key-2",
+    ]
+
+
+def test_every_key_limited_waits_then_gives_up_after_four(chain, monkeypatch):
+    waits = []
+    monkeypatch.setattr(llm_mod.time, "sleep", waits.append)
+    transport = FakeTransport(*[(429, TPM_429)] * 10)
+    with pytest.raises(LLMError, match="rate limited on every key") as err:
+        LLM(chain, transport).chat([], [])
+    assert err.value.status == 429
+    assert len(waits) == llm_mod.MAX_RATE_RETRIES
+    assert all(w == pytest.approx(3.0, abs=0.1) for w in waits)
+
+
+def test_rate_limit_wait_parses_ms_minutes_and_defaults():
+    assert llm_mod.rate_limit_wait_s("Please try again in 590ms.") == pytest.approx(
+        1.09
+    )
+    assert llm_mod.rate_limit_wait_s("try again in 1m2.5s") == llm_mod.MAX_WAIT_S
+    assert llm_mod.rate_limit_wait_s("slow down") == 5.5
+
+
+def test_pacing_waits_until_the_window_has_room(monkeypatch):
+    clock = [1000.0]
+    waits = []
+    monkeypatch.setattr(llm_mod.time, "monotonic", lambda: clock[0])
+
+    def sleep(seconds):
+        waits.append(seconds)
+        clock[0] += seconds
+
+    monkeypatch.setattr(llm_mod.time, "sleep", sleep)
+    budget = "LLM_API_KEY:openai/gpt-oss-120b"
+    llm_mod.record_usage(budget, 6000, clock[0] - 20)
+    transport = FakeTransport((200, groq_response(content="ok")))
+    assert LLM(settings(), transport).chat([], []).text == "ok"
+    # 6000 used 20 s ago + this request (1500 max output) > 7000: wait 40 s.
+    assert waits == [pytest.approx(40.0)]
+    assert llm_mod.pacing_wait_s(budget, 10, clock[0]) == 0.0
 
 
 def test_all_endpoints_exhausted_raises(chain):

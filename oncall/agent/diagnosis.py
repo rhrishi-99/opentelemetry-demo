@@ -4,16 +4,23 @@ import json
 from typing import get_args
 
 from oncall.agent import taxonomy
+from oncall.agent.evidence import supports_component
 from oncall.agent.llm import LLM, LLMError
 from oncall.agent.prompts import DIAGNOSE
 from oncall.agent.runlog import RunLog
 from oncall.models import Alert, Category, Diagnosis, llm_query
+from oncall.safety.allowlist import DEMO_SERVICES
 
 SUBMIT = "submit_diagnosis"
 MAX_REASONING_CHARS = 800
 MAX_ATTEMPTS = 2
 CATEGORY_NAMES = list(get_args(Category))
 DECISIONS = ["act", "escalate", "no_action"]
+FALLBACK_NOTE = "rule-based fallback (LLM unavailable)"
+FALLBACK_CONFIDENCE = 0.75
+FLAGGED = " | FLAGGED: "
+# container_health problems that mean the container itself is down.
+DOWN_PROBLEMS = ("not running", "restarted", "OOM-killed")
 
 SUBMIT_SCHEMA = {
     "name": SUBMIT,
@@ -72,6 +79,57 @@ def escalate_unknown(reason: str, affected: list[str] | None = None) -> Diagnosi
         "decision": "escalate",
         "reasoning": reason[:MAX_REASONING_CHARS],
     }
+
+
+def down_containers(run: RunLog) -> dict[str, tuple[str, str]]:
+    """{name: (evidence id, problems)} for demo containers container_health found
+    not running, restarting or OOM-killed."""
+    down = {}
+    for eid, item in run.evidence_index().items():
+        if not eid.startswith("container:"):
+            continue
+        name = eid.split(":", 1)[1]
+        problems = (item.get("text") or "").partition(FLAGGED)[2]
+        if name in DEMO_SERVICES and any(p in problems for p in DOWN_PROBLEMS):
+            down[name] = (eid, problems)
+    return down
+
+
+def rule_based(run: RunLog, alert: Alert, why: str) -> Diagnosis:
+    """Diagnose from the run log alone when the LLM cannot: one down demo container
+    is the candidate; several, or none, escalate."""
+    down = down_containers(run)
+    if len(down) == 1:
+        ((name, (container_id, problems)),) = down.items()
+        related = [
+            eid
+            for eid, item in run.evidence_index().items()
+            if eid.split(":", 1)[0] in ("log", "trace")
+            and supports_component(item, name)
+        ]
+        return {
+            "component": name,
+            "category": "container_down",
+            "cause": f"{name} is down: {problems}",
+            "confidence": FALLBACK_CONFIDENCE,
+            "evidence_ids": [container_id, *related],
+            "affected_services": [name],
+            "alternatives": [],
+            "decision": "act",
+            "reasoning": (
+                f"{FALLBACK_NOTE}: exactly one demo container is down ({name}). {why}"
+            )[:MAX_REASONING_CHARS],
+        }
+    if down:
+        return escalate_unknown(
+            f"{FALLBACK_NOTE}: {len(down)} demo containers are down "
+            f"({', '.join(sorted(down))}). {why}",
+            sorted(down),
+        )
+    affected = [alert["service"]] if alert.get("service") else []
+    return escalate_unknown(
+        f"{FALLBACK_NOTE}: no down container in the run log. {why}", affected
+    )
 
 
 def _is_str_list(value: object) -> bool:
@@ -187,10 +245,9 @@ def build_prompt(run: RunLog, alert: Alert) -> str:
 def diagnose(run: RunLog, alert: Alert, llm: LLM) -> Diagnosis:
     """Ask the LLM for a Diagnosis via a forced submit_diagnosis call.
 
-    One retry on invalid output; after that, or on an LLM error, return an
-    escalate Diagnosis with category "unknown". Never raises.
+    One retry on invalid output; after that, or on an LLM error, fall back to
+    rule_based(). Never raises.
     """
-    affected = [alert["service"]] if alert.get("service") else []
     messages = [{"role": "user", "content": build_prompt(run, alert)}]
     problems: list[str] = []
     for attempt in range(1, MAX_ATTEMPTS + 1):
@@ -198,7 +255,7 @@ def diagnose(run: RunLog, alert: Alert, llm: LLM) -> Diagnosis:
             reply = llm.chat(messages, [SUBMIT_SCHEMA])
         except LLMError as exc:
             run.log("error", where="diagnose", attempt=attempt, error=str(exc))
-            d = escalate_unknown(f"LLM call failed during diagnosis: {exc}", affected)
+            d = rule_based(run, alert, f"LLM call failed during diagnosis: {exc}")
             run.log("decision", diagnosis=d, valid=False)
             return d
         run.log(
@@ -230,9 +287,10 @@ def diagnose(run: RunLog, alert: Alert, llm: LLM) -> Diagnosis:
             }
         )
 
-    d = escalate_unknown(
+    d = rule_based(
+        run,
+        alert,
         f"Diagnosis output invalid after {MAX_ATTEMPTS} attempts: {'; '.join(problems)}",
-        affected,
     )
     run.log("decision", diagnosis=d, valid=False)
     return d

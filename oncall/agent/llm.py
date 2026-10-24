@@ -5,10 +5,12 @@ Another provider would translate to and from this format inside this module.
 """
 
 import json
+import logging
 import re
 import time
 import urllib.error
 import urllib.request
+from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass, field
 
@@ -20,9 +22,19 @@ TIMEOUT_S = 60
 RETRY_STATUSES = (429, 500, 502, 503, 504)
 MAX_ATTEMPTS = 4
 MAX_WAIT_S = 60
+# Per-minute 429s: sleeps allowed per call once every key is cooling down.
+MAX_RATE_RETRIES = 4
+RATE_LIMIT_DEFAULT_S = 5.0
+RATE_LIMIT_MARGIN_S = 0.5
+# Pace each key below Groq's 8000 tokens/minute free-tier limit.
+TOKENS_PER_MINUTE = 7000
+WINDOW_S = 60.0
+# Extra keys for the primary model, tried in order after LLM_API_KEY.
+EXTRA_KEY_ENVS = tuple(f"GROQ_KEY_{n}" for n in range(2, 10))
 BAD_GENERATION_CODES = ("tool_use_failed", "output_parse_failed")
-# Matches the wait in Groq's rate-limit message, e.g. "Please try again in 18.77s".
-RETRY_IN = re.compile(r"try again in ([0-9.]+)s")
+# Matches the wait in Groq's rate-limit message: "try again in 18.77s", "in 590ms"
+# or "in 1m2.5s" (group 1 = minutes, 2 = number, 3 = unit).
+RETRY_IN = re.compile(r"try again in (?:(\d+)m)?([0-9.]+)(ms|s)")
 # A daily quota in a rate-limit message: "tokens per day (TPD)", "requests per
 # day (RPD)" or any "per day"/"daily" wording, in any case.
 DAILY_QUOTA = re.compile(r"per day|\b(TPD|RPD)\b|daily", re.IGNORECASE)
@@ -31,6 +43,8 @@ USER_AGENT = "incident-zero-oncall/0.1"
 
 # transport(url, headers, body) -> (status, response_json_text)
 Transport = Callable[[str, dict, dict], tuple[int, str]]
+
+log = logging.getLogger(__name__)
 
 
 class LLMError(RuntimeError):
@@ -48,6 +62,7 @@ class LLMReply:
     tool_calls: list[dict] = field(default_factory=list)
     usage: dict = field(default_factory=dict)
     model: str = ""
+    key: str = ""
 
 
 def _urllib_transport(url: str, headers: dict, body: dict) -> tuple[int, str]:
@@ -85,11 +100,26 @@ def _retryable(status: int, text: str) -> bool:
     )
 
 
-def _wait_s(text: str, attempt: int) -> float:
-    """Seconds to wait before retrying: the provider's hint if given, else backoff."""
+def _hinted_s(text: str) -> float | None:
     match = RETRY_IN.search(text)
-    wait = float(match.group(1)) + 1 if match else 2**attempt
-    return min(wait, MAX_WAIT_S)
+    if not match:
+        return None
+    minutes, number, unit = match.groups()
+    seconds = float(number) / 1000 if unit == "ms" else float(number)
+    return int(minutes or 0) * 60 + seconds
+
+
+def _wait_s(text: str, attempt: int) -> float:
+    """Seconds to wait before retrying a server error: the hint if given, else backoff."""
+    hinted = _hinted_s(text)
+    return min(hinted if hinted is not None else 2**attempt, MAX_WAIT_S)
+
+
+def rate_limit_wait_s(text: str) -> float:
+    """Seconds to wait after a per-minute 429: Groq's hint (default 5 s) plus a margin."""
+    hinted = _hinted_s(text)
+    wait = RATE_LIMIT_DEFAULT_S if hinted is None else hinted
+    return min(wait + RATE_LIMIT_MARGIN_S, MAX_WAIT_S)
 
 
 def _parse_tool_call(raw: dict) -> dict:
@@ -119,9 +149,42 @@ class Endpoint:
     def label(self) -> str:
         return f"{self.provider}:{self.model}"
 
+    @property
+    def budget(self) -> str:
+        """Groq rate-limits each key per model."""
+        return f"{self.key_env}:{self.model}"
+
 
 # Entries whose daily quota ran out; skipped for the rest of the process.
 EXHAUSTED: set[Endpoint] = set()
+# key env name -> (monotonic time, tokens) of its calls in the last WINDOW_S.
+USAGE: dict[str, deque] = {}
+
+
+def estimate_tokens(body: dict) -> int:
+    """Tokens Groq counts for a request: the prompt (~4 chars/token) plus max output."""
+    prompt = json.dumps(body.get("messages", [])) + json.dumps(body.get("tools", []))
+    return len(prompt) // 4 + int(body.get("max_completion_tokens") or 0)
+
+
+def pacing_wait_s(key_env: str, tokens: int, now: float) -> float:
+    """Seconds until `tokens` more fit in the key's per-minute budget (0 if now)."""
+    window = USAGE.setdefault(key_env, deque())
+    while window and now - window[0][0] >= WINDOW_S:
+        window.popleft()
+    used = sum(spent for _, spent in window)
+    if used + tokens <= TOKENS_PER_MINUTE:
+        return 0.0
+    for at, spent in window:
+        used -= spent
+        if used + tokens <= TOKENS_PER_MINUTE:
+            return max(0.0, at + WINDOW_S - now)
+    # A request bigger than the whole budget waits for an empty window.
+    return max(0.0, window[-1][0] + WINDOW_S - now)
+
+
+def record_usage(key_env: str, tokens: int, now: float) -> None:
+    USAGE.setdefault(key_env, deque()).append((now, tokens))
 
 
 def parse_fallbacks(spec: str) -> list[Endpoint]:
@@ -149,6 +212,10 @@ class QuotaExhausted(LLMError):
     """The endpoint's daily quota is used up; try the next one."""
 
 
+class RateLimited(LLMError):
+    """A per-minute 429: try another key now, or wait."""
+
+
 class LLM:
     def __init__(
         self, settings: Settings | None = None, transport: Transport | None = None
@@ -163,6 +230,10 @@ class LLM:
             model = self.settings.LLM_MODEL or DEFAULT_MODELS.get(provider, "")
             self.chain = [Endpoint(provider, model, "LLM_API_KEY")]
             self.keys = {"LLM_API_KEY": self.settings.LLM_API_KEY}
+            for key_env in EXTRA_KEY_ENVS:
+                if key := secret(key_env):
+                    self.chain.append(Endpoint(provider, model, key_env))
+                    self.keys[key_env] = key
         for e in self.chain:
             if e.provider not in PROVIDER_BASE_URLS:
                 raise LLMError(
@@ -173,6 +244,8 @@ class LLM:
                 raise LLMError(f"{e.key_env} is not set (put it in oncall/.env)")
         first = self.chain[0]
         self.provider, self.model = first.provider, first.model
+        # endpoint -> monotonic time its per-minute 429 clears
+        self.cooldown: dict[Endpoint, float] = {}
 
     def _url(self, endpoint: Endpoint) -> str:
         base = self.settings.LLM_BASE_URL or PROVIDER_BASE_URLS[endpoint.provider]
@@ -181,27 +254,64 @@ class LLM:
     def chat(self, messages: list[dict], tools: list[dict]) -> LLMReply:
         """Send one chat turn at temperature 0; the model must call a tool.
 
-        Walks the fallback chain: an endpoint whose daily quota is exhausted is
-        skipped for the rest of the process. reply.model names the one used.
+        Every call goes through here. It picks the first endpoint (key) that is
+        free now: not out of daily quota (skipped for the rest of the process),
+        not cooling down after a per-minute 429, and with room in its token
+        budget. If none is free it waits for the soonest one. reply.model and
+        reply.key name the endpoint that served the call.
         """
-        skipped = []
-        for endpoint in self.chain:
-            if endpoint in EXHAUSTED:
-                skipped.append(endpoint.label)
-                continue
+        skipped: list[str] = []
+        rate_waits = 0
+        last_429 = ""
+        while True:
+            live = [e for e in self.chain if e not in EXHAUSTED]
+            if not live:
+                raise LLMError(
+                    "all LLM endpoints are out of daily quota: "
+                    f"{', '.join(skipped or [e.label for e in self.chain])}",
+                    status=429,
+                )
+            now = time.monotonic()
+            tokens = estimate_tokens(self._body(live[0], messages, tools))
+            wait, _, endpoint = min(
+                (
+                    max(
+                        self.cooldown.get(e, 0.0) - now,
+                        pacing_wait_s(e.budget, tokens, now),
+                    ),
+                    i,
+                    e,
+                )
+                for i, e in enumerate(live)
+            )
+            if wait > 0:
+                if self.cooldown.get(endpoint, 0.0) > now:
+                    if rate_waits == MAX_RATE_RETRIES:
+                        raise LLMError(
+                            f"rate limited on every key after {MAX_RATE_RETRIES} "
+                            f"retries: {last_429[:300]}",
+                            status=429,
+                            body=last_429,
+                        )
+                    rate_waits += 1
+                    log.info("rate limited on every key: waiting %.1fs", wait)
+                else:
+                    log.info("pacing %.1fs on %s", wait, endpoint.budget)
+                time.sleep(wait)
+                self.cooldown.pop(endpoint, None)
             try:
-                return self._chat_one(endpoint, messages, tools)
+                return self._chat_one(endpoint, messages, tools, tokens)
             except QuotaExhausted:
                 EXHAUSTED.add(endpoint)
                 skipped.append(endpoint.label)
-        raise LLMError(
-            f"all LLM endpoints are out of daily quota: {', '.join(skipped)}",
-            status=429,
-        )
+            except RateLimited as exc:
+                last_429 = exc.body
+                self.cooldown[endpoint] = time.monotonic() + rate_limit_wait_s(exc.body)
+                log.info("429 on %s: trying the next key", endpoint.budget)
 
-    def _chat_one(
+    def _body(
         self, endpoint: Endpoint, messages: list[dict], tools: list[dict]
-    ) -> LLMReply:
+    ) -> dict:
         body = {
             "model": endpoint.model,
             "messages": messages,
@@ -211,6 +321,12 @@ class LLM:
         if tools:
             body["tools"] = to_function_tools(tools)
             body["tool_choice"] = "required"
+        return body
+
+    def _chat_one(
+        self, endpoint: Endpoint, messages: list[dict], tools: list[dict], tokens: int
+    ) -> LLMReply:
+        body = self._body(endpoint, messages, tools)
         headers = {
             "Authorization": f"Bearer {self.keys[endpoint.key_env]}",
             "Content-Type": "application/json",
@@ -233,6 +349,12 @@ class LLM:
                     status=status,
                     body=text,
                 )
+            if status == 429:
+                raise RateLimited(
+                    f"{endpoint.label} rate limited: {text[:300]}",
+                    status=status,
+                    body=text,
+                )
             if not _retryable(status, text) or attempt == MAX_ATTEMPTS - 1:
                 break
             time.sleep(_wait_s(text, attempt))
@@ -249,9 +371,15 @@ class LLM:
             raise LLMError(
                 f"unexpected {endpoint.provider} response: {text[:500]}"
             ) from exc
+        usage = data.get("usage") or {}
+        record_usage(
+            endpoint.budget, int(usage.get("total_tokens") or tokens), time.monotonic()
+        )
+        log.info("LLM call served by %s with %s", endpoint.label, endpoint.key_env)
         return LLMReply(
             text=message.get("content") or "",
             tool_calls=[_parse_tool_call(c) for c in message.get("tool_calls") or []],
-            usage=data.get("usage") or {},
+            usage=usage,
             model=endpoint.label,
+            key=endpoint.key_env,
         )

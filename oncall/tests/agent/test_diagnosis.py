@@ -225,3 +225,68 @@ def test_investigate_prompt_limits_repeated_tool_calls():
         "If a tool returns nothing twice, move on to a different tool or finish."
         in text
     )
+
+
+def _containers(rl, *lines):
+    evidence = [
+        {"id": f"container:{line.split(':', 1)[0]}", "text": line, "ts": None}
+        for line in lines
+    ]
+    rl.log(
+        "tool_result",
+        step=9,
+        name="container_health",
+        result=make_result("container_health", {}, "containers", evidence),
+    )
+
+
+def _llm_down(messages):
+    raise LLMError("HTTP 429: rate limited")
+
+
+def test_fallback_picks_the_single_down_container(tmp_path):
+    rl = RunLog(run_id="fb1", runs_dir=str(tmp_path))
+    rl.log(
+        "tool_result",
+        step=1,
+        name="search_logs",
+        result=make_result(
+            "search_logs",
+            {"service": "cart"},
+            "redis errors",
+            [
+                {"id": "log:cart:1@t", "text": "cannot connect to redis", "ts": None},
+                {"id": "log:ad:1@t", "text": "ad timeout", "ts": None},
+            ],
+        ),
+    )
+    _containers(
+        rl,
+        "valkey-cart: state=exited, health=unhealthy | FLAGGED: not running "
+        "(state=exited, exit_code=0); healthcheck unhealthy",
+        "product-catalog: state=running, health=healthy | FLAGGED: CPU 110% of limit",
+        "cart: state=running, health=healthy",
+    )
+    d = diagnose(rl, ALERT, ScriptedLLM([_llm_down]))
+    assert d["component"] == "valkey-cart"
+    assert d["category"] == "container_down"
+    assert d["confidence"] == diagnosis.FALLBACK_CONFIDENCE
+    assert d["evidence_ids"] == ["container:valkey-cart", "log:cart:1@t"]
+    assert d["affected_services"] == ["valkey-cart"]
+    assert d["reasoning"].startswith("rule-based fallback (LLM unavailable)")
+    assert "HTTP 429" in d["reasoning"]
+
+
+def test_fallback_escalates_when_two_containers_are_down(tmp_path):
+    rl = RunLog(run_id="fb2", runs_dir=str(tmp_path))
+    _containers(
+        rl,
+        "valkey-cart: state=exited | FLAGGED: not running (state=exited, exit_code=0)",
+        "email: state=running | FLAGGED: restarted 3 times, last start 1 min ago",
+    )
+    d = diagnose(rl, ALERT, ScriptedLLM([_llm_down]))
+    assert d["decision"] == "escalate"
+    assert d["category"] == "unknown"
+    assert d["component"] is None
+    assert d["affected_services"] == ["email", "valkey-cart"]
+    assert d["reasoning"].startswith("rule-based fallback (LLM unavailable)")
