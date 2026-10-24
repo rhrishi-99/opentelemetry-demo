@@ -22,7 +22,7 @@ import httpx
 import pandas as pd
 import streamlit as st
 
-from oncall.agent.loop import investigate_and_diagnose
+from oncall.agent.orchestrator import run_incident
 from oncall.agent.runlog import RunLog
 from oncall.agent.taxonomy import CLIENT_SERVICES
 from oncall.config import Settings, load_settings
@@ -597,6 +597,34 @@ def health_panel(settings: Settings, auto: bool, interval: int) -> None:
             st.rerun(scope="app")
 
 
+def run_job(alert: dict, runlog: RunLog, dry_run: bool, runner=None) -> None:
+    """Background thread body: the full orchestrated run (detective, planner, human
+    gate via the UI's approval file, operator). A crash is logged as an "error"
+    event and still gets a report, so the UI never waits on a dead thread."""
+    try:
+        (runner or run_incident)(alert, dry_run=dry_run, channel="ui", runlog=runlog)
+    except Exception as exc:  # noqa: BLE001
+        runlog.log("error", where="ui", error=f"{type(exc).__name__}: {exc}")
+        if not [e for e in runlog.events("decision") if e.get("stage") == "report"]:
+            try:
+                report_run(alert, None, runlog)
+            except Exception as report_exc:  # noqa: BLE001
+                runlog.log("error", where="ui", error=f"report: {report_exc}")
+
+
+def awaiting_approval(events: list[dict]) -> bool:
+    """The planner handed a proposal to the human gate and no decision came back yet."""
+    to_gate = [
+        i
+        for i, e in enumerate(events)
+        if e.get("event") == "handoff" and e.get("to") == "human_gate"
+    ]
+    return bool(to_gate) and not any(
+        e.get("event") == "handoff" and e.get("from") == "human_gate"
+        for e in events[to_gate[-1] :]
+    )
+
+
 def start_run(
     settings: Settings,
     description: str,
@@ -616,15 +644,10 @@ def start_run(
         signal, _, services = auto
         alert.update(source="detector", signal=ALERT_SIGNALS.get(signal, "manual"))
 
-    def work() -> None:
-        diagnosis = None
-        try:
-            diagnosis = investigate_and_diagnose(alert, runlog=runlog)["diagnosis"]
-        except Exception as exc:  # noqa: BLE001
-            runlog.log("error", where="ui", error=f"{type(exc).__name__}: {exc}")
-        report_run(alert, diagnosis, runlog)
-
-    thread = threading.Thread(target=work, daemon=True)
+    dry_run = not st.session_state.get("execute_for_real", False)
+    thread = threading.Thread(
+        target=run_job, args=(alert, runlog, dry_run), daemon=True
+    )
     thread.start()
     with shared["lock"]:
         shared["current"] = {
@@ -633,6 +656,7 @@ def start_run(
             "trigger": "auto" if auto else "manual",
             "signal": auto[1] if auto else description,
             "services": services,
+            "dry_run": dry_run,
         }
         if not auto and services:
             shared["last"] = (time.time(), services)
@@ -646,6 +670,12 @@ def render_alert_form(settings: Settings, services: list[str], running: bool) ->
     description = st.text_input("What is wrong?", DEFAULT_ALERT)
     options = [ANY_SERVICE, *sorted(s for s in services if s not in EXCLUDED_SERVICES)]
     service = st.selectbox("Service (optional)", options)
+    st.toggle(
+        "Execute for real",
+        key="execute_for_real",
+        help="Off: the operator only dry-runs the approved action. Applies to the "
+        "next run, including auto-detect runs.",
+    )
     if st.button("Investigate", type="primary", disabled=running):
         start_run(settings, description, None if service == ANY_SERVICE else service)
 
@@ -803,7 +833,8 @@ def render_details(
     events: list[dict],
     running: bool,
 ) -> None:
-    finishes = [e for e in events if e["event"] == "finish"]
+    # The orchestrator logs a second finish (status only) after the detective's.
+    finishes = [e for e in events if e["event"] == "finish" and e.get("summary")]
     reports = [e for e in events if e.get("stage") == "report"]
     if d is not None:
         reasoning, notes = summary.confidence_notes(d.get("reasoning", ""))
@@ -1040,7 +1071,9 @@ def _render_planner(review: dict | None, proposal: dict | None) -> None:
         )
 
 
-def _render_human_gate(settings: Settings, run_id: str, proposal: dict | None) -> None:
+def _render_human_gate(
+    settings: Settings, run_id: str, proposal: dict | None, dry_run: bool = True
+) -> None:
     st.subheader("Human gate")
     kill_path = Path(settings.KILL_SWITCH_FILE)
     kill_key = f"kill-switch-{run_id}"
@@ -1061,15 +1094,11 @@ def _render_human_gate(settings: Settings, run_id: str, proposal: dict | None) -
     if kill_error:
         st.error(f"Could not update kill switch: {kill_error}")
 
-    execute_for_real = st.toggle(
-        "Execute for real",
-        value=False,
-        disabled=kill_enabled,
-        key=f"execute-for-real-{run_id}",
-        help="Off by default; approval records dry_run=true.",
+    st.caption(
+        "Dry-run mode (set when the run started)"
+        if dry_run
+        else "Real execution (set when the run started)"
     )
-    dry_run = not execute_for_real
-    st.caption("Dry-run mode" if dry_run else "Real execution requested")
     approval = _read_approval(settings, run_id)
     if approval:
         verdict = "Approved" if approval.get("approved") else "Rejected"
@@ -1129,13 +1158,33 @@ def render_run(settings: Settings, run_id: str, running: bool) -> None:
     st.subheader("Investigation")
     render_run_header(settings, runlog, running)
 
+    for e in events:
+        if e["event"] == "error" and e.get("where") == "ui":
+            st.error(f"Run failed: {e.get('error')}")
+    current = current_run()
+    dry_run = current.get("dry_run", True) if current.get("run_id") == run_id else True
     finishes = [e for e in events if e["event"] == "finish"]
     decisions = [e for e in events if e["event"] == "decision" and "diagnosis" in e]
     diagnosis = decisions[-1]["diagnosis"] if decisions else None
+    gate_shown = False
+    if running and awaiting_approval(events):
+        _, proposal, _ = _planner_data(events)
+        st.warning("Waiting for your approval: the gate times out after 2 minutes.")
+        if proposal:
+            with st.container(border=True):
+                st.markdown(
+                    f"### ▶ {proposal.get('action')}({proposal.get('target')}) · "
+                    f"risk {proposal.get('risk', '?')}"
+                )
+                st.text(proposal.get("reason", ""))
+        _render_human_gate(settings, run_id, proposal, dry_run)
+        gate_shown = True
     if diagnosis is not None:
         plan = render_summary(runlog, diagnosis, events)
-        if plan["proposal"] is not None:
-            _render_human_gate(settings, run_id, plan["proposal"])
+        if plan["proposal"] is not None and not gate_shown:
+            _render_human_gate(settings, run_id, plan["proposal"], dry_run)
+    elif not running and not finishes:
+        st.error("The run stopped before producing a diagnosis.")
     elif finishes:
         st.caption(
             "Waiting for the diagnosis…" if running else "No diagnosis in this run."

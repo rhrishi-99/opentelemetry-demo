@@ -324,3 +324,14 @@ def test_single_endpoint_reply_names_its_model():
         [], []
     )
     assert reply.model == "groq:openai/gpt-oss-120b"
+
+
+def test_waiting_more_than_the_budget_raises(chain, monkeypatch):
+    waits = []
+    monkeypatch.setattr(llm_mod.time, "sleep", waits.append)
+    slow = '{"error":{"message":"tokens per minute (TPM): Please try again in 30s."}}'
+    transport = FakeTransport(*[(429, slow)] * 6)
+    with pytest.raises(LLMError, match="wait budget exceeded") as err:
+        LLM(chain, transport).chat([], [])
+    assert err.value.status == 429
+    assert sum(waits) <= llm_mod.MAX_WAIT_PER_CALL_S
