@@ -11,8 +11,6 @@ Every hand-off across boundaries is logged to the run log as event 'handoff'.
 
 from __future__ import annotations
 
-import json
-import os
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -34,8 +32,8 @@ from oncall.models import (
     Proposal,
 )
 from oncall.report.output import PREVENTION, report_run
-from oncall.safety import execute as execute_action
-from oncall.safety import validate_action
+from oncall.safety import approval as human_approval
+from oncall.safety import executor, killswitch, validate_action
 from oncall.tools import TOOL_SCHEMAS, TOOLS
 
 
@@ -248,10 +246,7 @@ class HumanGate:
 
     def kill_switch_engaged(self) -> bool:
         """Check if kill switch file exists or KILL_SWITCH=1 is set in env."""
-        if os.environ.get("KILL_SWITCH") in ("1", "true", "yes", "on"):
-            return True
-        kill_file = Path(self.settings.KILL_SWITCH_FILE)
-        return kill_file.is_file()
+        return killswitch.engaged(self.settings)
 
     def request_approval(
         self,
@@ -280,53 +275,38 @@ class HumanGate:
                 "comment": "No action proposed; human approval skipped",
             }
 
-        if channel == "ui":
-            approval_file = (
-                Path(self.settings.RUNS_DIR) / "approvals" / f"{run_id}.json"
-            )
-            if approval_file.is_file():
-                try:
-                    data = json.loads(approval_file.read_text(encoding="utf-8"))
-                    return {
-                        "approved": bool(data.get("approved", False)),
-                        "by": data.get("by", "human_ui"),
-                        "ts": ts,
-                        "comment": data.get("comment", "UI decision recorded"),
-                    }
-                except (json.JSONDecodeError, OSError):
-                    pass
-            return {
-                "approved": False,
-                "by": "human_ui",
-                "ts": ts,
-                "comment": "UI approval pending or timeout",
-            }
-
-        # CLI Channel
-        prompt_text = (
-            f"\n[APPROVAL REQUEST] Run ID: {run_id}\n"
-            f"Component: {diagnosis.get('component')} | Category: {diagnosis.get('category')}\n"
-            f"Proposal: {proposal['action']} on {proposal['target']}\n"
-            f"Reason: {proposal['reason']}\n"
-            f"Type 'yes' to approve action: "
+        return human_approval.request_approval(
+            proposal,
+            diagnosis,
+            channel,  # type: ignore[arg-type]
+            run_id=run_id,
+            settings=self.settings,
+            input_fn=input_fn,
         )
-        if input_fn is not None:
-            user_response = input_fn(prompt_text)
-        else:
-            try:
-                user_response = input(prompt_text)
-            except (EOFError, OSError):
-                user_response = "no"
 
-        is_approved = (user_response or "").strip().lower() == "yes"
-        return {
-            "approved": is_approved,
-            "by": "human_cli",
-            "ts": ts,
-            "comment": "Approved via CLI"
-            if is_approved
-            else "Rejected by operator in CLI",
-        }
+
+def execute_action(
+    req: ActionRequest,
+    settings: Settings,
+    *,
+    runlog: RunLog,
+    approval: Approval | None,
+    dry_run: bool,
+    channel: str = "cli",
+    diagnosis: Diagnosis | None = None,
+) -> ActionResult:
+    """Every action goes through the F23 gate: kill switch, allowlist, the human's
+    approval (asked here if `approval` is None, e.g. for a rollback), dry run, and
+    only then the Action API itself."""
+    return executor.execute_request(
+        req,
+        runlog,
+        dry_run,
+        approval=approval,
+        settings=settings,
+        channel=channel,  # type: ignore[arg-type]
+        diagnosis=diagnosis,
+    )
 
 
 class Operator:
@@ -342,6 +322,7 @@ class Operator:
         approval: Approval,
         runlog: RunLog,
         dry_run: bool = True,
+        channel: str = "cli",
     ) -> Execution:
         """Execute approved proposal via Action API, verify, and write incident report."""
         proposal = plan["proposal"]
@@ -351,10 +332,7 @@ class Operator:
         status = "no_action"
 
         # Check kill switch before touching Action API
-        kill_switch = (
-            os.environ.get("KILL_SWITCH") in ("1", "true", "yes", "on")
-            or Path(self.settings.KILL_SWITCH_FILE).is_file()
-        )
+        kill_switch = killswitch.engaged(self.settings)
 
         if kill_switch or approval.get("by") == "kill_switch":
             status = "aborted"
@@ -374,7 +352,15 @@ class Operator:
                 "run_id": runlog.run_id,
                 "dry_run": dry_run,
             }
-            action_result = execute_action(action_req, self.settings)
+            action_result = execute_action(
+                action_req,
+                self.settings,
+                runlog=runlog,
+                approval=approval,
+                dry_run=dry_run,
+                channel=channel,
+                diagnosis=diagnosis,
+            )
             runlog.log(
                 "action",
                 action_id=action_result.get("ts"),
@@ -396,7 +382,16 @@ class Operator:
                 rollback_res = None
                 if action_result.get("executed") and action_result.get("rollback"):
                     rollback_req = action_result["rollback"]
-                    rollback_res = execute_action(rollback_req, self.settings)
+                    # The human approves the rollback the same way as the action.
+                    rollback_res = execute_action(
+                        rollback_req,
+                        self.settings,
+                        runlog=runlog,
+                        approval=None,
+                        dry_run=dry_run,
+                        channel=channel,
+                        diagnosis=diagnosis,
+                    )
                     runlog.log(
                         "action",
                         action_id=rollback_res.get("ts"),
@@ -525,7 +520,7 @@ def run_incident(
     # Agent 3: Operator
     operator = Operator(settings=settings)
     execution = operator.execute_and_report(
-        investigation, plan, approval, runlog, dry_run=dry_run
+        investigation, plan, approval, runlog, dry_run=dry_run, channel=channel
     )
 
     runlog.log("finish", status=execution["status"], report=execution["report_path"])
