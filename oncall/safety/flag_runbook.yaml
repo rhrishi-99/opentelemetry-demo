@@ -1,0 +1,29 @@
+# Static runbook mapping demo services to their known failure flag keys.
+# Written from demo documentation; NEVER read or modified dynamically by the agent.
+ad:
+  - adFailure
+  - adHighCpu
+  - adManualGc
+cart:
+  - cartFailure
+  - failedReadinessProbe
+  - cartMetricCardinalityOverflow
+email:
+  - emailMemoryLeak
+payment:
+  - paymentFailure
+  - paymentUnreachable
+product-catalog:
+  - productCatalogFailure
+  - productCatalogLockContention
+recommendation:
+  - recommendationCacheFailure
+shipping:
+  - intlShippingSlowdown
+frontend:
+  - imageSlowLoad
+load-generator:
+  - loadGeneratorFloodHomepage
+fraud-detection:
+  - kafkaConsumerDead
+  - kafkaQueueProblems

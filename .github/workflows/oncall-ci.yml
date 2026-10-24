@@ -103,6 +103,17 @@ jobs:
             echo "$hits"
             exit 1
           fi
+      - name: Action API only imported by safety layer
+        run: |
+          hits=$(grep -rnE 'import.*action_api|from.*action_api' oncall/ 2>/dev/null \
+            | grep -v '^oncall/safety/' \
+            | grep -v '^oncall/tests/safety/' \
+            | grep -v '/__pycache__/' || true)
+          if [ -n "$hits" ]; then
+            echo "::error::action_api imported outside oncall/safety/ and oncall/tests/safety/:"
+            echo "$hits"
+            exit 1
+          fi
       - name: No committed secrets
         run: |
           # Key shapes: OpenAI-style and Anthropic-style keys, AWS access key IDs, GitHub personal tokens.
