@@ -7,18 +7,21 @@ Order, every time:
   4. dry run            log "would do X", call nothing
   5. kill switch again  engaged after approval -> blocked
   6. Action API         oncall.safety.action_api.execute (the only caller)
-Every step is written to the run log. This module is deterministic Python: no
+Every step is written to the run log, and every outcome to runs/actions.jsonl. This module is deterministic Python: no
 LLM, no free-form input, and CI checks that nothing else imports action_api.
 """
 
 import logging
+import uuid
 from collections.abc import Callable
 from datetime import UTC, datetime
+from pathlib import Path
 
 from oncall.agent.runlog import RunLog
 from oncall.config import Settings, load_settings
 from oncall.models import ActionRequest, ActionResult, Approval, Diagnosis, Proposal
 from oncall.safety import killswitch
+from oncall.safety.actionlog import log_action
 from oncall.safety.approval import APPROVAL_TIMEOUT_S, Channel, request_approval
 
 log = logging.getLogger(__name__)
@@ -100,11 +103,17 @@ def execute(
     run.log("handoff", stage="executor", proposal=proposal, dry_run=dry_run)
 
     if killswitch.engaged(settings):
-        return _finish(run, _blocked(req, "kill switch engaged", allowed=False))
+        return _finish(
+            run, _blocked(req, "blocked: kill switch engaged", allowed=False), settings
+        )
 
     allowed, detail = _validate(req)
     if not allowed:
-        return _finish(run, _blocked(req, f"not allowlisted: {detail}", allowed=False))
+        return _finish(
+            run,
+            _blocked(req, f"blocked: not allowlisted: {detail}", allowed=False),
+            settings,
+        )
 
     if approval is None:
         approval = request_approval(
@@ -118,8 +127,8 @@ def execute(
         )
     run.log("handoff", stage="approval", approval=approval)
     if approval["approved"] is not True:
-        detail = f"not approved by {approval['by']}: {approval['comment']}"
-        return _finish(run, _blocked(req, detail, allowed=True))
+        detail = f"rejected by {approval['by']}: {approval['comment']}"
+        return _finish(run, _blocked(req, detail, allowed=True), settings)
 
     if dry_run:
         result = _blocked(
@@ -128,16 +137,20 @@ def execute(
             allowed=True,
         )
         result["ok"] = True
-        return _finish(run, result)
+        return _finish(run, result, settings)
 
     if killswitch.engaged(settings):
         return _finish(
-            run, _blocked(req, "kill switch engaged after approval", allowed=True)
+            run,
+            _blocked(req, "blocked: kill switch engaged after approval", allowed=True),
+            settings,
         )
 
     api_execute = _action_api_execute()
     if api_execute is None:
-        return _finish(run, _blocked(req, "Action API unavailable", allowed=True))
+        return _finish(
+            run, _blocked(req, "Action API unavailable", allowed=True), settings
+        )
     try:
         result = api_execute(req, settings)
     except Exception as exc:  # the API promises not to raise; stay safe anyway
@@ -145,6 +158,8 @@ def execute(
         result = _blocked(
             req, f"Action API raised {type(exc).__name__}: {exc}", allowed=True
         )
+        return _finish(run, result, settings)
+    # The Action API wrote its own actions.jsonl line.
     return _finish(run, result)
 
 
@@ -218,6 +233,18 @@ def rollback_gate(
     return approve_rollback, execute_rollback
 
 
-def _finish(run: RunLog, result: ActionResult) -> ActionResult:
+def _finish(
+    run: RunLog, result: ActionResult, audit: Settings | None = None
+) -> ActionResult:
+    """Log the outcome to the run log and, with `audit`, to runs/actions.jsonl.
+
+    `audit` is given for every outcome the Action API never saw.
+    """
     run.log("action", result=result)
+    if audit is not None:
+        log_action(
+            result,
+            f"act-{uuid.uuid4().hex[:8]}",
+            Path(audit.RUNS_DIR) / "actions.jsonl",
+        )
     return result
