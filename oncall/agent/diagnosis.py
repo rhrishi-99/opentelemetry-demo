@@ -1,10 +1,11 @@
 """Diagnosis step: turn a finished investigation into a structured Diagnosis."""
 
 import json
+import re
 from typing import get_args
 
 from oncall.agent import taxonomy
-from oncall.agent.evidence import supports_component
+from oncall.agent.evidence import service_of, supports_component
 from oncall.agent.llm import LLM, LLMError
 from oncall.agent.prompts import DIAGNOSE
 from oncall.agent.runlog import RunLog
@@ -13,10 +14,22 @@ from oncall.safety.allowlist import DEMO_SERVICES
 
 SUBMIT = "submit_diagnosis"
 MAX_REASONING_CHARS = 800
-MAX_ATTEMPTS = 2
+# Forced submit_diagnosis calls, then one tool_choice="auto" try.
+MAX_ATTEMPTS = 3
 CATEGORY_NAMES = list(get_args(Category))
 DECISIONS = ["act", "escalate", "no_action"]
-FALLBACK_NOTE = "rule-based fallback (LLM unavailable)"
+FALLBACK_NOTE = "rule-based diagnosis (LLM unavailable)"
+NUDGE = f"You MUST call {SUBMIT} now."
+# Groq's 400 when a required tool call is missing or malformed.
+TOOL_FAILURE = re.compile(r"tool_use_failed|did not call a tool")
+# search_logs evidence starts with its line count: "x19 [cart] ...".
+LOG_COUNT = re.compile(r"^x(\d+) ")
+# get_metrics evidence: "<service> <metric> <now> (baseline <base>, ...)".
+METRIC_TEXT = re.compile(
+    r"^\S+ (?P<metric>\w+) (?P<now>[0-9.]+) \(baseline (?P<base>[0-9.]+)"
+)
+# Services whose error/latency regressions count as impact of a down dependency.
+DEPENDENTS = {"valkey-cart": ("cart",)}
 FALLBACK_CONFIDENCE = 0.75
 FLAGGED = " | FLAGGED: "
 # container_health problems that mean the container itself is down.
@@ -95,41 +108,95 @@ def down_containers(run: RunLog) -> dict[str, tuple[str, str]]:
     return down
 
 
-def rule_based(run: RunLog, alert: Alert, why: str) -> Diagnosis:
-    """Diagnose from the run log alone when the LLM cannot: one down demo container
-    is the candidate; several, or none, escalate."""
-    down = down_containers(run)
-    if len(down) == 1:
-        ((name, (container_id, problems)),) = down.items()
-        related = [
-            eid
-            for eid, item in run.evidence_index().items()
-            if eid.split(":", 1)[0] in ("log", "trace")
-            and supports_component(item, name)
-        ]
-        return {
-            "component": name,
-            "category": "container_down",
-            "cause": f"{name} is down: {problems}",
-            "confidence": FALLBACK_CONFIDENCE,
-            "evidence_ids": [container_id, *related],
-            "affected_services": [name],
-            "alternatives": [],
-            "decision": "act",
-            "reasoning": (
-                f"{FALLBACK_NOTE}: exactly one demo container is down ({name}). {why}"
-            )[:MAX_REASONING_CHARS],
-        }
-    if down:
-        return escalate_unknown(
-            f"{FALLBACK_NOTE}: {len(down)} demo containers are down "
-            f"({', '.join(sorted(down))}). {why}",
-            sorted(down),
+def _regressed(text: str) -> bool:
+    m = METRIC_TEXT.match(text)
+    if not m:
+        return False
+    now, base = float(m["now"]), float(m["base"])
+    return now > base and (m["metric"] != "error_rate" or now >= 0.01)
+
+
+def support(name: str, index: dict) -> tuple[list[str], int, list[str]]:
+    """(evidence ids, error count, calling services) pointing at a down container:
+    its own container item, other services' logs/traces/metrics naming it or an
+    alias, and regressions on the services that depend on it."""
+    ids, errors, callers = [f"container:{name}"], 0, []
+    for eid, item in index.items():
+        kind = eid.split(":", 1)[0]
+        if kind not in ("log", "trace", "metric"):
+            continue
+        text = item.get("text") or ""
+        service = service_of({**item, "id": eid})
+        if service == name:
+            continue
+        mentions = kind != "metric" and supports_component({**item, "id": eid}, name)
+        depends = (
+            kind == "metric"
+            and service in DEPENDENTS.get(name, ())
+            and _regressed(text)
         )
-    affected = [alert["service"]] if alert.get("service") else []
-    return escalate_unknown(
-        f"{FALLBACK_NOTE}: no down container in the run log. {why}", affected
+        if not (mentions or depends):
+            continue
+        ids.append(eid)
+        if mentions:
+            m = LOG_COUNT.match(text)
+            errors += int(m.group(1)) if m else 1
+            if service and service not in callers:
+                callers.append(service)
+    return ids, errors, callers
+
+
+def _impact(name: str, errors: int, callers: list[str]) -> str:
+    if callers:
+        return f"{', '.join(callers)} can't reach it ({errors} errors)"
+    return "no user-facing errors"
+
+
+def rule_based(run: RunLog, alert: Alert, why: str) -> Diagnosis:
+    """Diagnose from the run log alone when the LLM cannot.
+
+    The down demo containers are ranked by the evidence pointing at them; the top
+    one is the component. One down container may act (the F13/F15 rules decide);
+    several always escalate."""
+    index = run.evidence_index()
+    down = down_containers(run)
+    if not down:
+        affected = [alert["service"]] if alert.get("service") else []
+        return escalate_unknown(
+            f"{FALLBACK_NOTE}: no down container in the run log. {why}", affected
+        )
+    scored = {name: support(name, index) for name in down}
+    # Ties go to a container with user-facing dependents (valkey-cart -> cart).
+    ranked = sorted(
+        down,
+        key=lambda n: (-len(scored[n][0]), -scored[n][1], n not in DEPENDENTS, n),
     )
+    top = ranked[0]
+    ids, errors, callers = scored[top]
+    category = "dependency_unavailable" if callers else "container_down"
+    cause = f"{top} down → {_impact(top, errors, callers)}"
+    for other in ranked[1:]:
+        _, other_errors, other_callers = scored[other]
+        cause += f"; {other} also down ({_impact(other, other_errors, other_callers)})"
+    evidence = list(
+        dict.fromkeys([*ids, *(i for n in ranked[1:] for i in scored[n][0])])
+    )
+    note = (
+        f"exactly one demo container is down ({top})"
+        if len(down) == 1
+        else f"{len(down)} demo containers are down; {top} has the most evidence"
+    )
+    return {
+        "component": top,
+        "category": category,
+        "cause": cause,
+        "confidence": FALLBACK_CONFIDENCE,
+        "evidence_ids": [e for e in evidence if e in index],
+        "affected_services": ranked,
+        "alternatives": [],
+        "decision": "act" if len(down) == 1 else "escalate",
+        "reasoning": f"{FALLBACK_NOTE}: {note}. {why}"[:MAX_REASONING_CHARS],
+    }
 
 
 def _is_str_list(value: object) -> bool:
@@ -242,11 +309,48 @@ def build_prompt(run: RunLog, alert: Alert) -> str:
     )
 
 
+def _fallback(run: RunLog, alert: Alert, why: str) -> Diagnosis:
+    d = rule_based(run, alert, why)
+    run.log("decision", diagnosis=d, valid=False)
+    return d
+
+
+def _json_object(text: str) -> dict | None:
+    """The first {...} object in a text reply, unwrapping {"arguments": {...}}."""
+    start, end = text.find("{"), text.rfind("}")
+    if start < 0 or end <= start:
+        return None
+    try:
+        value = json.loads(text[start : end + 1])
+    except json.JSONDecodeError:
+        return None
+    if isinstance(value, dict) and isinstance(value.get("arguments"), dict):
+        value = value["arguments"]
+    return value if isinstance(value, dict) else None
+
+
+def _submitted(reply, allow_text: bool = False) -> tuple[dict | None, list[str]]:
+    """(valid diagnosis args or None, problems) from one reply."""
+    calls = [c for c in reply.tool_calls if c["name"] == SUBMIT]
+    if calls:
+        args = calls[0]["args"]
+        if args is None:
+            return None, [calls[0].get("error", "arguments missing")]
+    elif allow_text and (args := _json_object(reply.text or "")) is not None:
+        pass
+    else:
+        return None, [f"you must call {SUBMIT}; got no {SUBMIT} call"]
+    problems = check(args)
+    return (None, problems) if problems else (args, [])
+
+
 def diagnose(run: RunLog, alert: Alert, llm: LLM) -> Diagnosis:
     """Ask the LLM for a Diagnosis via a forced submit_diagnosis call.
 
-    One retry on invalid output; after that, or on an LLM error, fall back to
-    rule_based(). Never raises.
+    A missing or invalid call (including Groq's 400 tool_use_failed) is retried
+    with a nudge, then tried once with tool_choice="auto" reading JSON from the
+    text. Anything else, or if that fails too, falls back to rule_based(). Never
+    raises.
     """
     messages = [{"role": "user", "content": build_prompt(run, alert)}]
     problems: list[str] = []
@@ -255,9 +359,14 @@ def diagnose(run: RunLog, alert: Alert, llm: LLM) -> Diagnosis:
             reply = llm.chat(messages, [SUBMIT_SCHEMA])
         except LLMError as exc:
             run.log("error", where="diagnose", attempt=attempt, error=str(exc))
-            d = rule_based(run, alert, f"LLM call failed during diagnosis: {exc}")
-            run.log("decision", diagnosis=d, valid=False)
-            return d
+            if not TOOL_FAILURE.search(f"{exc} {exc.body}"):
+                return _fallback(run, alert, f"LLM call failed during diagnosis: {exc}")
+            problems = [f"no {SUBMIT} call: {str(exc)[:200]}"]
+            messages.append({"role": "user", "content": NUDGE})
+            continue
+        except Exception as exc:  # noqa: BLE001
+            run.log("error", where="diagnose", attempt=attempt, error=str(exc))
+            return _fallback(run, alert, f"LLM call failed during diagnosis: {exc}")
         run.log(
             "llm_call",
             step="diagnose",
@@ -265,32 +374,33 @@ def diagnose(run: RunLog, alert: Alert, llm: LLM) -> Diagnosis:
             model=reply.model,
             usage=reply.usage,
         )
-
-        calls = [c for c in reply.tool_calls if c["name"] == SUBMIT]
-        if not calls:
-            problems = [f"you must call {SUBMIT}; got no {SUBMIT} call"]
-        elif calls[0]["args"] is None:
-            problems = [calls[0].get("error", "arguments missing")]
-        else:
-            problems = check(calls[0]["args"])
-        if not problems:
-            d = _post_check(calls[0]["args"])
+        args, problems = _submitted(reply)
+        if args is not None:
+            d = _post_check(args)
             run.log("decision", diagnosis=d, valid=True, attempt=attempt)
             return d
-
         run.log("error", where="diagnose", attempt=attempt, problems=problems)
         messages.append(
             {
                 "role": "user",
                 "content": f"Your diagnosis was invalid: {'; '.join(problems)}. "
-                f"Call {SUBMIT} again with every field valid.",
+                f"Call {SUBMIT} again with every field valid. {NUDGE}",
             }
         )
 
-    d = rule_based(
+    try:
+        reply = llm.chat(messages, [SUBMIT_SCHEMA], tool_choice="auto")
+        args, auto_problems = _submitted(reply, allow_text=True)
+    except Exception as exc:  # noqa: BLE001
+        run.log("error", where="diagnose", attempt="auto", error=str(exc))
+        args, auto_problems = None, []
+    if args is not None:
+        d = _post_check(args)
+        run.log("decision", diagnosis=d, valid=True, attempt="auto")
+        return d
+    return _fallback(
         run,
         alert,
-        f"Diagnosis output invalid after {MAX_ATTEMPTS} attempts: {'; '.join(problems)}",
+        f"Diagnosis output invalid after {MAX_ATTEMPTS} attempts: "
+        f"{'; '.join(problems or auto_problems)}",
     )
-    run.log("decision", diagnosis=d, valid=False)
-    return d

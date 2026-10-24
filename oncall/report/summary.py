@@ -395,7 +395,7 @@ def _next(
         targets = list(dict.fromkeys([*flagged_containers(index), *targets]))
     steps = []
     reasoning, _ = confidence_notes(d.get("reasoning", ""))
-    if reasoning.startswith(("LLM call failed", "rule-based fallback")):
+    if reasoning.startswith(("LLM call failed", "rule-based")):
         steps.append("LLM was unavailable: re-run the investigation when it is back")
     steps.append(
         f"Check: {', then '.join(targets)}" if targets else "Check the evidence below"
