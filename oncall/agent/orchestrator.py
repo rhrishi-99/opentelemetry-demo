@@ -30,11 +30,29 @@ from oncall.models import (
     Investigation,
     Plan,
     Proposal,
+    Verification,
 )
 from oncall.report.output import PREVENTION, report_run
 from oncall.safety import approval as human_approval
 from oncall.safety import executor, killswitch, validate_action
+from oncall.safety.verify import verify
 from oncall.tools import TOOL_SCHEMAS, TOOLS
+
+VERIFY_TIMEOUT_S = 120
+VERIFY_POLL_S = 10
+
+
+def _verification(recovered: bool, outcome: str, notes: str) -> Verification:
+    return {
+        "recovered": recovered,
+        "checks": [],
+        "polls": 0,
+        "duration_s": 0.0,
+        "rolled_back": False,
+        "rollback_result": None,
+        "outcome": outcome,  # type: ignore[typeddict-item]
+        "notes": notes,
+    }
 
 
 def _create_manual_alert(description: str, service: str | None = None) -> Alert:
@@ -315,6 +333,30 @@ class Operator:
     def __init__(self, settings: Settings | None = None) -> None:
         self.settings = settings or load_settings()
 
+    def _verify(
+        self,
+        investigation: Investigation,
+        diagnosis: Diagnosis,
+        action_result: ActionResult,
+        runlog: RunLog,
+    ) -> Verification:
+        """F24 verify for an executed action; a dry run is never 'recovered'."""
+        if action_result.get("dry_run") or not action_result.get("executed"):
+            return _verification(False, "skipped_dry_run", "dry run: nothing executed")
+        try:
+            return verify(
+                investigation["alert"],
+                diagnosis,
+                action_result,
+                timeout_s=VERIFY_TIMEOUT_S,
+                poll_s=VERIFY_POLL_S,
+                runlog=runlog,
+            )
+        except Exception as exc:  # noqa: BLE001
+            return _verification(
+                False, "not_recovered_escalated", f"verify failed: {exc}"
+            )
+
     def execute_and_report(
         self,
         investigation: Investigation,
@@ -372,12 +414,14 @@ class Operator:
 
             # Verification
             if action_result["ok"]:
-                verification = {
-                    "recovered": True,
-                    "target": proposal["target"],
-                    "checks": [{"signal": "action_api_executed", "ok": True}],
-                }
-                status = "success"
+                verification = self._verify(
+                    investigation, diagnosis, action_result, runlog
+                )
+                status = (
+                    "success"
+                    if verification["outcome"] in ("recovered", "skipped_dry_run")
+                    else "escalated"
+                )
             else:
                 rollback_res = None
                 if action_result.get("executed") and action_result.get("rollback"):

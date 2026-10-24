@@ -174,10 +174,14 @@ def propose(d: Diagnosis, run: RunLog, llm: LLM | None = None) -> Proposal | Non
     if action not in ALLOWED_ACTIONS:
         return None
     target = "load-generator" if action == "throttle_load" else component
-    text = _proposal_text(d, action, target, params, run, llm)
-    if text is None:
-        return None
-    reason, expected = text
+    # The LLM only words the reason; if it fails, the fix itself still stands.
+    reason, expected = _proposal_text(d, action, target, params, run, llm) or (
+        (
+            f"{d['category']} on {component}: {action} is the allowlisted remedy "
+            "for this category"
+        ),
+        f"{target} recovers after {action}",
+    )
     risk = "medium" if d["category"] == "resource_cpu" else ACTION_RISK[action]
     proposal: Proposal = {
         "action": action,

@@ -1,7 +1,7 @@
 """Tests for the three-agent orchestrator with typed hand-offs (F28)."""
 
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -298,7 +298,80 @@ def test_operator_executes_only_approved_proposal(
     assert execution["action_result"] is not None
     assert execution["action_result"]["ok"] is True
     assert execution["verification"] is not None
-    assert execution["verification"]["recovered"] is True
+    assert execution["verification"]["recovered"] is False
+    assert execution["verification"]["outcome"] == "skipped_dry_run"
+
+
+def _approved_restart(test_settings: Settings, runlog: RunLog, verify_mock):
+    inv = make_investigation()
+    plan: Plan = {
+        "review": {},
+        "diagnosis_final": inv["diagnosis"],
+        "proposal": {
+            "action": "restart_service",
+            "target": "cartservice",
+            "params": {},
+            "reason": "Recover cartservice",
+            "expected_effect": "Healthy container",
+            "rollback_hint": "idempotent",
+            "risk": "low",
+        },
+        "prevention": "Alerting",
+    }
+    approval: Approval = {
+        "approved": True,
+        "by": "human_cli",
+        "ts": "2026-10-24T10:05:00Z",
+        "comment": "Approved",
+    }
+    executed = {
+        "request": {},
+        "allowed": True,
+        "executed": True,
+        "dry_run": False,
+        "ok": True,
+        "detail": "Restarted cartservice",
+        "before": {},
+        "after": {},
+        "rollback": None,
+        "ts": "2026-10-24T10:05:01Z",
+    }
+    with (
+        patch("oncall.agent.orchestrator.execute_action", return_value=executed),
+        patch("oncall.agent.orchestrator.verify", verify_mock),
+    ):
+        return Operator(settings=test_settings).execute_and_report(
+            inv, plan, approval, runlog, dry_run=False
+        )
+
+
+def test_operator_verifies_a_real_action(test_settings: Settings, runlog: RunLog):
+    verify_mock = MagicMock(
+        return_value={
+            "recovered": True,
+            "checks": [],
+            "polls": 2,
+            "duration_s": 20.0,
+            "rolled_back": False,
+            "rollback_result": None,
+            "outcome": "recovered",
+            "notes": "",
+        }
+    )
+    execution = _approved_restart(test_settings, runlog, verify_mock)
+    verify_mock.assert_called_once()
+    assert verify_mock.call_args.kwargs["timeout_s"] == 120
+    assert verify_mock.call_args.kwargs["poll_s"] == 10
+    assert execution["status"] == "success"
+    assert execution["verification"]["outcome"] == "recovered"
+
+
+def test_operator_escalates_when_verify_fails(test_settings: Settings, runlog: RunLog):
+    verify_mock = MagicMock(side_effect=RuntimeError("prometheus down"))
+    execution = _approved_restart(test_settings, runlog, verify_mock)
+    assert execution["status"] == "escalated"
+    assert execution["verification"]["outcome"] == "not_recovered_escalated"
+    assert "prometheus down" in execution["verification"]["notes"]
 
 
 def test_operator_rollback_on_failed_action(
