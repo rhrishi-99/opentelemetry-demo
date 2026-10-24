@@ -5,7 +5,6 @@ from unittest import mock
 import pytest
 
 from oncall.config import Settings
-from oncall.safety.exclusions import EXCLUDED_SERVICES
 from oncall.platform import alert
 from oncall.platform.alert import (
     Debouncer,
@@ -14,6 +13,7 @@ from oncall.platform.alert import (
     merge_alerts,
     watch,
 )
+from oncall.safety.exclusions import EXCLUDED_SERVICES
 from oncall.tools.backends import BackendError
 
 NOW = datetime(2026, 10, 23, 12, 0, 0, tzinfo=UTC)
