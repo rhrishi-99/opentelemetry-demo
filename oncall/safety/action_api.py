@@ -53,7 +53,7 @@ def run_docker(cmd: list[str], timeout: int = 30) -> tuple[int, str, str]:
             check=False,
         )
         return proc.returncode, proc.stdout.strip(), proc.stderr.strip()
-    except Exception as exc:
+    except (OSError, subprocess.SubprocessError) as exc:
         return 1, "", str(exc)
 
 
@@ -68,8 +68,8 @@ def inspect_container_state(target: str) -> dict[str, Any]:
                 "running": bool(state.get("Running", False)),
                 "exit_code": state.get("ExitCode", 0),
             }
-        except Exception:
-            pass
+        except (json.JSONDecodeError, KeyError, TypeError):
+            return {"status": "unknown", "running": False}
     return {"status": "unknown", "running": False}
 
 
@@ -104,7 +104,7 @@ def apply_disable_flags(
         updated_text = json.dumps(data, indent=2) + "\n"
         flag_file.write_text(updated_text, encoding="utf-8")
         return True, f"Disabled {disabled_count} failure flags in runbook"
-    except Exception as exc:
+    except (OSError, json.JSONDecodeError) as exc:
         return False, f"Failed updating flags: {exc}"
 
 
@@ -120,7 +120,7 @@ def apply_restore_flags(
         raw_bytes = backup_file.read_bytes()
         flag_file.write_bytes(raw_bytes)
         return True, f"Restored flag file from backup {backup_file.name}"
-    except Exception as exc:
+    except OSError as exc:
         return False, f"Failed restoring flag backup: {exc}"
 
 
@@ -132,8 +132,8 @@ def get_locust_users(base_url: str = LOCUST_BASE_URL) -> int | None:
         if resp.status_code == 200:
             data = resp.json()
             return int(data.get("user_count", 0))
-    except Exception:
-        pass
+    except (httpx.HTTPError, ValueError, json.JSONDecodeError):
+        return None
     return None
 
 
@@ -150,7 +150,7 @@ def set_locust_users(users: int, base_url: str = LOCUST_BASE_URL) -> tuple[bool,
         if resp.status_code in (200, 204):
             return True, f"Locust swarm set to {users} users"
         return False, f"Locust returned HTTP {resp.status_code}: {resp.text[:200]}"
-    except Exception as exc:
+    except (httpx.HTTPError, OSError) as exc:
         return False, f"Locust request failed: {exc}"
 
 
@@ -298,7 +298,13 @@ def execute(
                 executed = ok
                 after = {"users": target_users} if ok else {}
 
-    except Exception as exc:
+    except (
+        RuntimeError,
+        ValueError,
+        OSError,
+        httpx.HTTPError,
+        json.JSONDecodeError,
+    ) as exc:
         ok = False
         detail = f"Action execution error: {exc}"
 

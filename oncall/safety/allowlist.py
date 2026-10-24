@@ -149,14 +149,15 @@ def validate_action(
                 params,
             )
 
-        if action == "restore_flags":
-            if not (params.get("backup_file") or params.get("backup_path")):
-                return (
-                    False,
-                    "restore_flags requires params.backup_file or params.backup_path",
-                    target,
-                    params,
-                )
+        if action == "restore_flags" and not (
+            params.get("backup_file") or params.get("backup_path")
+        ):
+            return (
+                False,
+                "restore_flags requires params.backup_file or params.backup_path",
+                target,
+                params,
+            )
 
         return True, "Action permitted by allowlist", target, params
 
