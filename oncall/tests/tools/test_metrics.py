@@ -283,3 +283,41 @@ def test_spans_calling_the_flag_service_are_dropped() -> None:
     assert [e["id"].split("@")[0] for e in result["evidence"]] == [
         "metric:top_errors:payment/Charge"
     ]
+
+
+def _series(*pairs):
+    return {
+        "status": "success",
+        "data": {
+            "resultType": "vector",
+            "result": [
+                {"metric": {"service_name": svc}, "value": [1, str(val)]}
+                for svc, val in pairs
+            ],
+        },
+    }
+
+
+def test_absent_baseline_series_is_unavailable_not_zero() -> None:
+    backend = MagicMock()
+    backend.prom_query.side_effect = [
+        _series(("checkout", 4900.0), ("frontend", 800.0)),
+        _series(("frontend", 700.0)),
+    ]
+    result = get_metrics(metric="latency_p95", backend=backend)
+    texts = {e["id"].split(":")[2].split("@")[0]: e["text"] for e in result["evidence"]}
+    assert "baseline unavailable" in texts["checkout"]
+    assert "baseline 700.0000" in texts["frontend"]
+
+
+def test_error_rate_absent_baseline_is_zero_only_with_traffic() -> None:
+    backend = MagicMock()
+    backend.prom_query.side_effect = [
+        _series(("payment", 0.28), ("quote", 0.10), ("cart", 0.0)),
+        _series(("cart", 0.0)),
+        _series(("payment", 3.5), ("cart", 2.0)),  # rps at the baseline
+    ]
+    result = get_metrics(metric="error_rate", backend=backend)
+    texts = {e["id"].split(":")[2].split("@")[0]: e["text"] for e in result["evidence"]}
+    assert "(baseline 0.0000" in texts["payment"]
+    assert "baseline unavailable" in texts["quote"]

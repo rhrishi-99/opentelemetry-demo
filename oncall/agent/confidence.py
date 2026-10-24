@@ -12,6 +12,7 @@ from oncall.agent.runlog import RunLog
 from oncall.agent.taxonomy import CLIENT_SERVICES
 from oncall.config import load_settings
 from oncall.models import Diagnosis
+from oncall.safety.exclusions import INFRA_SERVICES
 
 MAX_REASONING_CHARS = 800
 MAX_CONFIDENCE = 0.95
@@ -50,7 +51,7 @@ class Signals:
         return {
             s
             for s in {*self.regressions, *self.container_faults}
-            if s not in CLIENT_SERVICES
+            if s not in CLIENT_SERVICES and s not in INFRA_SERVICES
         }
 
 

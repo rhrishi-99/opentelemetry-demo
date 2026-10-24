@@ -10,7 +10,7 @@ from datetime import UTC, datetime
 from typing import Any, Literal
 
 from oncall.models import Evidence, ToolResult, make_error, make_result
-from oncall.safety.exclusions import is_excluded
+from oncall.safety.exclusions import is_excluded, is_infra
 from oncall.tools.backends import BackendError, TelemetryBackend, get_backend
 from oncall.tools.registry import register_tool
 
@@ -293,6 +293,8 @@ def search_logs(
         _ships_logs[hit_service] = (True, time.monotonic())
 
         if is_excluded(hit_service) or not _matches_level(hit_lvl, level):
+            continue
+        if is_infra(hit_service) and hit_service != service:
             continue
 
         if contains_filter and contains_filter not in hit_msg.lower():

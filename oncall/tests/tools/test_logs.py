@@ -7,7 +7,7 @@ from unittest.mock import MagicMock
 import httpx
 import pytest
 
-from oncall.safety.exclusions import EXCLUDED_SERVICES
+from oncall.safety.exclusions import EXCLUDED_SERVICES, INFRA_SERVICES
 from oncall.tools import logs as logs_module
 from oncall.tools.backends import BackendError, LiveBackend, OfflineBackend
 from oncall.tools.logs import (
@@ -136,15 +136,13 @@ def test_backend_error_returns_ok_false():
 
 
 def test_offline_replay_of_recorded_baseline():
-    """The recorded baseline replays for any limit/window the agent picks."""
+    """The recorded baseline replays for any limit/window the agent picks; its only
+    error lines are the collector's own, which are telemetry noise."""
     backend = OfflineBackend(scenario="baseline")
     res = search_logs(level="error", since_min=30, limit=50, backend=backend)
     assert res["ok"] is True
-    assert res["evidence"]
-    lines = res["summary"].splitlines()
-    assert len(lines) <= 1 + MAX_GROUPS
-    assert all(e["id"].startswith("log:") and "@" in e["id"] for e in res["evidence"])
-    assert all(len(e["text"]) <= MAX_EVIDENCE_TEXT + 20 for e in res["evidence"])
+    assert res["evidence"] == []
+    assert "otelcol" not in res["summary"]
 
 
 REAL_SAMPLE = Path(__file__).parents[1] / "fixtures" / "opensearch" / "logs_sample.json"
@@ -173,9 +171,15 @@ def test_real_docs_filtered_by_level_threshold():
     docs = _real_docs()
     errors = search_logs(level="error", backend=_backend_returning(docs))
     warns = search_logs(level="warn", backend=_backend_returning(docs))
-    assert errors["summary"].startswith("6 log lines level>='error'")
+    # The collector's own lines (otelcol-contrib) are telemetry noise.
+    assert errors["summary"].startswith("4 log lines level>='error'")
     assert "x4 [frontend] API request failed" in errors["summary"]
-    assert warns["summary"].startswith("8 log lines level>='warn'")
+    assert warns["summary"].startswith("4 log lines level>='warn'")
+    assert "otelcol" not in errors["summary"] + warns["summary"]
+    asked = search_logs(
+        service="otelcol-contrib", level="warn", backend=_backend_returning(docs)
+    )
+    assert "[otelcol-contrib]" in asked["summary"]
 
 
 def test_output_budget_and_unique_ids():
@@ -236,7 +240,13 @@ def test_live_query_uses_severity_number_and_service_keyword(monkeypatch):
     ]
     assert {"range": {"severity.number": {"gte": 13}}} in query["filter"]
     assert query["must_not"] == [
-        {"terms": {"resource.service.name.keyword": sorted(EXCLUDED_SERVICES)}}
+        {
+            "terms": {
+                "resource.service.name.keyword": sorted(
+                    EXCLUDED_SERVICES | INFRA_SERVICES
+                )
+            }
+        }
     ]
     assert sent["body"]["size"] == 5
 
