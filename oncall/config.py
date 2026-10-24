@@ -30,7 +30,7 @@ class Settings:
     LLM_FALLBACKS: str | None = None
     LLM_MAX_TOKENS: int = 1500
     LLM_MAX_PROMPT_TOKENS: int = 6000
-    MAX_STEPS: int = 8
+    MAX_STEPS: int = 6
     CONFIDENCE_MIN: float = 0.7
     RUNS_DIR: str = "runs"
     ACTION_API_URL: str | None = None

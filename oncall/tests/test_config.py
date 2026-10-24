@@ -11,7 +11,7 @@ def clean_env(monkeypatch):
 
 def test_defaults_when_no_env(tmp_path):
     settings = load_settings(tmp_path / "missing.env")
-    assert settings.MAX_STEPS == 8
+    assert settings.MAX_STEPS == 6
     assert settings.CONFIDENCE_MIN == 0.7
     assert settings.DRY_RUN is True
     assert settings.COMPOSE_PROJECT_NAME == "opentelemetry-demo"
@@ -30,7 +30,7 @@ def test_env_file_and_process_env(tmp_path, monkeypatch):
 def test_empty_value_keeps_default(tmp_path):
     env_file = tmp_path / ".env"
     env_file.write_text("MAX_STEPS=\n")
-    assert load_settings(env_file).MAX_STEPS == 8
+    assert load_settings(env_file).MAX_STEPS == 6
 
 
 def test_bad_bool_raises(tmp_path, monkeypatch):
