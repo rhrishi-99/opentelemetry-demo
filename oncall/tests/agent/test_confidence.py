@@ -208,6 +208,22 @@ def test_container_down_with_matching_trace_gets_bonus(run):
     assert (d["decision"], d["confidence"]) == ("act", 0.9)
 
 
+def test_alias_supported_evidence_from_distinct_tools_can_act(run):
+    container = _container("valkey-cart", "not running (state=exited, exit_code=0)")
+    trace = _ev("trace:abc/span:GetCart", "redis ERROR connection refused")
+    run.metrics("error_rate").containers(container).traces(trace)
+    d = assess(
+        _d(
+            component="valkey-cart",
+            category="dependency_unavailable",
+            confidence=0.8,
+            evidence_ids=[container["id"], trace["id"]],
+        ),
+        run.log,
+    )
+    assert (d["decision"], d["confidence"]) == ("act", 0.8)
+
+
 def test_two_unhealthy_containers_cap(run):
     a = _container("email", "not running (state=exited, exit_code=0)")
     b = _container("quote", "OOM-killed")

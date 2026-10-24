@@ -8,6 +8,11 @@ from dotenv import dotenv_values
 
 DEFAULT_ENV_FILE = Path(__file__).parent / ".env"
 
+COMPONENT_ALIASES = {
+    "valkey-cart": ("redis", "valkey", "cart-cache"),
+    "astronomy-db": ("postgres",),
+}
+
 
 @dataclass(frozen=True)
 class Settings:

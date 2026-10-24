@@ -1,6 +1,6 @@
 import pytest
 
-from oncall.agent.evidence import salvage, service_of, validate
+from oncall.agent.evidence import salvage, service_of, supports_component, validate
 from oncall.agent.runlog import RunLog
 from oncall.models import make_result
 
@@ -161,3 +161,45 @@ def test_service_of_each_id_kind(run):
     assert service_of(index[TRACE_CART]) == "cart"
     assert service_of(index["container:product-catalog"]) == "product-catalog"
     assert service_of(_ev("metric:top_errors:cart/GetCart@t", "")) == "cart"
+
+
+def test_component_alias_evidence_from_two_tools_avoids_thin_penalty(run):
+    container_id = "container:valkey-cart"
+    run.log(
+        "tool_result",
+        name="container_health",
+        result=make_result(
+            "container_health",
+            {},
+            "",
+            [_ev(container_id, "valkey-cart: state=running")],
+        ),
+    )
+    d, problems = validate(
+        _diagnosis(
+            component="valkey-cart",
+            evidence_ids=[container_id, TRACE_CART],
+            reasoning=f"redis is unavailable [{TRACE_CART}].",
+        ),
+        run,
+    )
+    assert d["confidence"] == 0.9
+    assert not any("thin evidence" in problem for problem in problems)
+
+
+def test_comma_separated_evidence_ids_are_split_and_normalized(run):
+    d, _problems = validate(
+        _diagnosis(
+            evidence_ids=[f"{M_CART}, {TRACE_CART}"],
+            reasoning=f"cart errors at 0.31 [{M_CART}, {TRACE_CART}].",
+        ),
+        run,
+    )
+    assert d["evidence_ids"] == [M_CART, TRACE_CART]
+    assert d["reasoning"] == f"cart errors at 0.31 [{M_CART}] [{TRACE_CART}]."
+
+
+def test_database_alias_is_detected_in_evidence_text():
+    assert supports_component(
+        _ev("trace:db/span:Query", "postgres ERROR refused"), "astronomy-db"
+    )

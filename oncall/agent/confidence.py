@@ -7,7 +7,7 @@ explained in the report. Run after the evidence validator (F13).
 import re
 from dataclasses import dataclass, field
 
-from oncall.agent.evidence import service_of, tool_of
+from oncall.agent.evidence import service_of, supports_component, tool_of
 from oncall.agent.runlog import RunLog
 from oncall.agent.taxonomy import CLIENT_SERVICES
 from oncall.config import load_settings
@@ -196,7 +196,7 @@ def assess(d: Diagnosis, run: RunLog) -> Diagnosis:
     component = out["component"]
     index = run.evidence_index()
     cited = [index[i] for i in out["evidence_ids"] if i in index]
-    own = [e for e in cited if service_of(e) == component]
+    own = [e for e in cited if component and supports_component(e, component)]
 
     if (
         component in signals.container_faults
@@ -205,7 +205,7 @@ def assess(d: Diagnosis, run: RunLog) -> Diagnosis:
     ):
         confidence = min(confidence + 0.1, MAX_CONFIDENCE)
         notes.append("container and trace/log signals agree: +0.1")
-    if len({tool_of(e["id"]) for e in cited}) == 1:
+    if own and len({tool_of(e["id"]) for e in own}) == 1:
         cap(0.55, "evidence from one tool only")
     if component and len(own) < 2:
         cap(0.5, f"fewer than 2 evidence items for {component}")
