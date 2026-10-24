@@ -95,6 +95,31 @@ class ActionResult(TypedDict):
     ts: str
 
 
+class VerifyCheck(TypedDict):
+    signal: str
+    target: str
+    before: str | None
+    after: str
+    ok: bool
+    ts: str
+
+
+class Verification(TypedDict):
+    recovered: bool
+    checks: list[VerifyCheck]
+    polls: int
+    duration_s: float
+    rolled_back: bool
+    rollback_result: dict | None
+    outcome: Literal[
+        "recovered",
+        "not_recovered_rolled_back",
+        "not_recovered_escalated",
+        "skipped_dry_run",
+    ]
+    notes: str
+
+
 class Proposal(TypedDict):
     action: str
     target: str
