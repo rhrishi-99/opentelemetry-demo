@@ -1,3 +1,4 @@
+import json
 import re
 from pathlib import Path
 
@@ -244,49 +245,138 @@ def _llm_down(messages):
     raise LLMError("HTTP 429: rate limited")
 
 
-def test_fallback_picks_the_single_down_container(tmp_path):
-    rl = RunLog(run_id="fb1", runs_dir=str(tmp_path))
+def _logs(rl, *items):
     rl.log(
         "tool_result",
         step=1,
         name="search_logs",
         result=make_result(
             "search_logs",
-            {"service": "cart"},
-            "redis errors",
-            [
-                {"id": "log:cart:1@t", "text": "cannot connect to redis", "ts": None},
-                {"id": "log:ad:1@t", "text": "ad timeout", "ts": None},
-            ],
+            {},
+            "logs",
+            [{"id": i, "text": t, "ts": None} for i, t in items],
         ),
+    )
+
+
+VALKEY_DOWN = (
+    "valkey-cart: state=exited, health=unhealthy | FLAGGED: not running "
+    "(state=exited, exit_code=0); healthcheck unhealthy"
+)
+EMAIL_DOWN = "email: state=exited | FLAGGED: not running (state=exited, exit_code=0)"
+
+
+def test_fallback_picks_the_single_down_container(tmp_path):
+    rl = RunLog(run_id="fb1", runs_dir=str(tmp_path))
+    _logs(
+        rl,
+        ("log:cart:1@t", "x19 [cart] cannot connect to redis"),
+        ("log:ad:1@t", "x2 [ad] ad timeout"),
     )
     _containers(
         rl,
-        "valkey-cart: state=exited, health=unhealthy | FLAGGED: not running "
-        "(state=exited, exit_code=0); healthcheck unhealthy",
+        VALKEY_DOWN,
         "product-catalog: state=running, health=healthy | FLAGGED: CPU 110% of limit",
         "cart: state=running, health=healthy",
     )
     d = diagnose(rl, ALERT, ScriptedLLM([_llm_down]))
     assert d["component"] == "valkey-cart"
-    assert d["category"] == "container_down"
+    # cart's errors reference it (via the redis alias): a dependency is unavailable.
+    assert d["category"] == "dependency_unavailable"
+    assert d["decision"] == "act"
     assert d["confidence"] == diagnosis.FALLBACK_CONFIDENCE
     assert d["evidence_ids"] == ["container:valkey-cart", "log:cart:1@t"]
-    assert d["affected_services"] == ["valkey-cart"]
-    assert d["reasoning"].startswith("rule-based fallback (LLM unavailable)")
+    assert d["cause"] == "valkey-cart down → cart can't reach it (19 errors)"
+    assert d["reasoning"].startswith("rule-based diagnosis (LLM unavailable)")
     assert "HTTP 429" in d["reasoning"]
 
 
-def test_fallback_escalates_when_two_containers_are_down(tmp_path):
+def test_fallback_ranks_two_down_containers_by_evidence(tmp_path):
     rl = RunLog(run_id="fb2", runs_dir=str(tmp_path))
-    _containers(
-        rl,
-        "valkey-cart: state=exited | FLAGGED: not running (state=exited, exit_code=0)",
-        "email: state=running | FLAGGED: restarted 3 times, last start 1 min ago",
+    _logs(rl, ("log:cart:1@t", "x19 [cart] Wasn't able to connect to redis"))
+    rl.log(
+        "tool_result",
+        step=2,
+        name="get_metrics",
+        result=make_result(
+            "get_metrics",
+            {},
+            "errors",
+            [
+                {
+                    "id": "metric:error_rate:cart@t",
+                    "text": "cart error_rate 0.1200 (baseline 0.0000, delta +0.1200)",
+                    "ts": None,
+                }
+            ],
+        ),
     )
+    _containers(rl, EMAIL_DOWN, VALKEY_DOWN)
     d = diagnose(rl, ALERT, ScriptedLLM([_llm_down]))
+    assert d["component"] == "valkey-cart"
+    assert d["affected_services"] == ["valkey-cart", "email"]
     assert d["decision"] == "escalate"
-    assert d["category"] == "unknown"
-    assert d["component"] is None
-    assert d["affected_services"] == ["email", "valkey-cart"]
-    assert d["reasoning"].startswith("rule-based fallback (LLM unavailable)")
+    assert d["category"] == "dependency_unavailable"
+    assert "container:valkey-cart" in d["evidence_ids"]
+    assert any(e.startswith("log:cart:") for e in d["evidence_ids"])
+    assert "metric:error_rate:cart@t" in d["evidence_ids"]
+    assert "container:email" in d["evidence_ids"]
+    assert d["cause"] == (
+        "valkey-cart down → cart can't reach it (19 errors); "
+        "email also down (no user-facing errors)"
+    )
+
+
+def test_tool_use_failed_is_retried_with_a_nudge_then_falls_back(tmp_path):
+    rl = RunLog(run_id="fb3", runs_dir=str(tmp_path))
+    _containers(rl, VALKEY_DOWN)
+    seen = []
+
+    def failed(messages):
+        seen.append(messages[-1]["content"])
+        raise LLMError(
+            'groq returned HTTP 400: {"error":{"code":"tool_use_failed"}}', status=400
+        )
+
+    llm = ScriptedLLM([failed])
+    d = diagnose(rl, ALERT, llm)
+    assert llm.calls == diagnosis.MAX_ATTEMPTS
+    assert seen[1:] == [diagnosis.NUDGE, diagnosis.NUDGE]
+    assert d["component"] == "valkey-cart"
+    assert d["reasoning"].startswith("rule-based diagnosis (LLM unavailable)")
+    assert "tool_use_failed" in d["reasoning"]
+
+
+def test_auto_tool_choice_reads_json_from_the_text(run):
+    class AutoLLM(ScriptedLLM):
+        def chat(self, messages, tools, tool_choice="required"):
+            if tool_choice == "auto":
+                body = json.dumps({"name": diagnosis.SUBMIT, "arguments": valid()})
+                return LLMReply(text=f"Here it is: {body}", tool_calls=[], usage=USAGE)
+            return super().chat(messages, tools)
+
+    text_only = lambda messages: LLMReply(text="I think cart", usage=USAGE)
+    d = diagnose(run, ALERT, AutoLLM([text_only]))
+    assert d["component"] == "cart"
+    assert run.events("decision")[-1]["attempt"] == "auto"
+
+
+def test_any_other_exception_falls_back(tmp_path):
+    rl = RunLog(run_id="fb4", runs_dir=str(tmp_path))
+    _containers(rl, VALKEY_DOWN)
+
+    def crash(messages):
+        raise TimeoutError("read timed out")
+
+    d = diagnose(rl, ALERT, ScriptedLLM([crash]))
+    assert d["component"] == "valkey-cart"
+    assert "read timed out" in d["reasoning"]
+
+
+def test_fallback_tie_goes_to_the_container_users_depend_on(tmp_path):
+    rl = RunLog(run_id="fb5", runs_dir=str(tmp_path))
+    _containers(rl, EMAIL_DOWN, VALKEY_DOWN)
+    d = diagnose(rl, ALERT, ScriptedLLM([_llm_down]))
+    assert d["component"] == "valkey-cart"
+    assert d["category"] == "container_down"
+    assert d["affected_services"] == ["valkey-cart", "email"]

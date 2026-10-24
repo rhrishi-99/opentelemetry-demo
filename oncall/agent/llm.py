@@ -251,8 +251,10 @@ class LLM:
         base = self.settings.LLM_BASE_URL or PROVIDER_BASE_URLS[endpoint.provider]
         return base.rstrip("/") + "/chat/completions"
 
-    def chat(self, messages: list[dict], tools: list[dict]) -> LLMReply:
-        """Send one chat turn at temperature 0; the model must call a tool.
+    def chat(
+        self, messages: list[dict], tools: list[dict], tool_choice: str = "required"
+    ) -> LLMReply:
+        """Send one chat turn at temperature 0; by default the model must call a tool.
 
         Every call goes through here. It picks the first endpoint (key) that is
         free now: not out of daily quota (skipped for the rest of the process),
@@ -272,7 +274,7 @@ class LLM:
                     status=429,
                 )
             now = time.monotonic()
-            tokens = estimate_tokens(self._body(live[0], messages, tools))
+            tokens = estimate_tokens(self._body(live[0], messages, tools, tool_choice))
             wait, _, endpoint = min(
                 (
                     max(
@@ -300,7 +302,7 @@ class LLM:
                 time.sleep(wait)
                 self.cooldown.pop(endpoint, None)
             try:
-                return self._chat_one(endpoint, messages, tools, tokens)
+                return self._chat_one(endpoint, messages, tools, tokens, tool_choice)
             except QuotaExhausted:
                 EXHAUSTED.add(endpoint)
                 skipped.append(endpoint.label)
@@ -310,7 +312,11 @@ class LLM:
                 log.info("429 on %s: trying the next key", endpoint.budget)
 
     def _body(
-        self, endpoint: Endpoint, messages: list[dict], tools: list[dict]
+        self,
+        endpoint: Endpoint,
+        messages: list[dict],
+        tools: list[dict],
+        tool_choice: str = "required",
     ) -> dict:
         body = {
             "model": endpoint.model,
@@ -320,13 +326,18 @@ class LLM:
         }
         if tools:
             body["tools"] = to_function_tools(tools)
-            body["tool_choice"] = "required"
+            body["tool_choice"] = tool_choice
         return body
 
     def _chat_one(
-        self, endpoint: Endpoint, messages: list[dict], tools: list[dict], tokens: int
+        self,
+        endpoint: Endpoint,
+        messages: list[dict],
+        tools: list[dict],
+        tokens: int,
+        tool_choice: str = "required",
     ) -> LLMReply:
-        body = self._body(endpoint, messages, tools)
+        body = self._body(endpoint, messages, tools, tool_choice)
         headers = {
             "Authorization": f"Bearer {self.keys[endpoint.key_env]}",
             "Content-Type": "application/json",
