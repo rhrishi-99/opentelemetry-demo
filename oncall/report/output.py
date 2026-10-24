@@ -340,9 +340,10 @@ def report_run(
     diagnosis: Diagnosis | None,
     run: RunLog,
     out_dir: str | Path = "reports",
+    **kwargs,
 ) -> tuple[Path, Path]:
     """Finalise and write the run's report; record where it went in the run log."""
-    report, notes = finalise_report(alert, diagnosis, run)
+    report, notes = finalise_report(alert, diagnosis, run, **kwargs)
     json_path, md_path = write(report, out_dir)
     run.log(
         "decision",
