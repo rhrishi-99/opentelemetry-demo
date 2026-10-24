@@ -10,6 +10,7 @@ from streamlit.testing.v1 import AppTest
 
 from oncall.agent.runlog import RunLog
 from oncall.models import make_error, make_result
+from oncall.report import summary
 from oncall.safety.exclusions import EXCLUDED_SERVICES
 from oncall.ui import app
 
@@ -319,7 +320,7 @@ def replay(tmp_path, monkeypatch):
 
 def test_replays_a_past_run(replay):
     at = AppTest.from_file(APP, default_timeout=30)
-    at.session_state["view_run"] = "r1"
+    at.session_state["active_run_id"] = "r1"
     at.run()
     assert not at.exception
     texts = [t.value for t in at.text]
@@ -327,7 +328,15 @@ def test_replays_a_past_run(replay):
     assert "cart errors" in texts
     assert "GetCart ERROR connection refused" in texts
     assert any("ESCALATE" in m.value for m in at.markdown)
-    assert [w.value for w in at.warning] == ["Not found in this run's evidence index."]
+    assert "Not in this run's evidence." in texts
+    assert not at.warning
+    assert any(
+        "cart — application errors" in m.value and "ESCALATE" in m.value
+        for m in at.markdown
+    )
+    assert any("INCIDENT SUMMARY" in c.value for c in at.caption)
+    assert any(e.label == "Full agent narrative" for e in at.expander)
+    assert any(e.label.startswith("Investigation steps (1)") for e in at.expander)
     assert all(b.disabled for b in at.button if b.label in ("Approve", "Reject"))
     assert not any("never shown" in str(x.value) for x in at.json)
     assert any("users report errors" in b.label for b in at.sidebar.button)
@@ -365,3 +374,30 @@ def test_jaeger_v3_services(monkeypatch):
         "other",
     ]
     assert seen["url"] == "http://127.0.0.1:8080/jaeger/ui/api/v3/services"
+
+
+def test_auto_run_debounce_ignores_flapping_and_waits_after_failure():
+    seen = frozenset({"email", "cart", "checkout"})
+    cooldown = app.AUTO_COOLDOWN_S
+    assert app.should_auto_run(frozenset({"email"}), None, 0)
+    assert not app.should_auto_run(frozenset(), None, 0)
+    assert not app.should_auto_run(frozenset({"email", "cart"}), (0, seen), 60)
+    assert app.should_auto_run(frozenset({"email", "payment"}), (0, seen), 60)
+    assert not app.should_auto_run(
+        frozenset({"email", "payment"}), (0, seen), 60, failed=True
+    )
+    assert app.should_auto_run(frozenset({"email"}), (0, seen), cooldown, failed=True)
+
+
+def test_confidence_notes_are_split_and_reworded():
+    reasoning, notes = summary.confidence_notes(
+        "cause found [confidence: evidence from one tool only: cap 0.55; "
+        "no alternatives falsified: -0.1; decision act -> escalate]"
+    )
+    assert reasoning == "cause found"
+    assert [app.friendly_note(n) for n in notes] == [
+        "capped at 55%: evidence from one tool only",
+        "-10%: no alternatives falsified",
+        "decision lowered: act → escalate",
+    ]
+    assert summary.confidence_notes("plain") == ("plain", [])
