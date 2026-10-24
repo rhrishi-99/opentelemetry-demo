@@ -34,6 +34,7 @@ from oncall.models import (
 from oncall.report.output import PREVENTION, report_run
 from oncall.safety import approval as human_approval
 from oncall.safety import executor, killswitch, validate_action
+from oncall.safety.verify import verify_and_maybe_rollback
 from oncall.tools import TOOL_SCHEMAS, TOOLS
 
 
@@ -309,6 +310,11 @@ def execute_action(
     )
 
 
+# Recovery is verified from telemetry (F24): read-only docker inspect, Jaeger error
+# spans and Prometheus, polled until healthy for 3 polls or VERIFY_WINDOW_S.
+verify_recovery = verify_and_maybe_rollback
+
+
 class Operator:
     """Deterministic Python executor: executes approved actions via Action API and writes report."""
 
@@ -323,6 +329,7 @@ class Operator:
         runlog: RunLog,
         dry_run: bool = True,
         channel: str = "cli",
+        input_fn: Any = None,
     ) -> Execution:
         """Execute approved proposal via Action API, verify, and write incident report."""
         proposal = plan["proposal"]
@@ -370,14 +377,31 @@ class Operator:
                 ok=action_result["ok"],
             )
 
-            # Verification
+            # Verification: did the system actually recover? (F24). A rollback,
+            # if needed, is offered to the human through the same gate.
             if action_result["ok"]:
-                verification = {
-                    "recovered": True,
-                    "target": proposal["target"],
-                    "checks": [{"signal": "action_api_executed", "ok": True}],
-                }
-                status = "success"
+                approve_rollback, execute_rollback = executor.rollback_gate(
+                    runlog,
+                    diagnosis=diagnosis,
+                    channel=channel,  # type: ignore[arg-type]
+                    dry_run=dry_run,
+                    settings=self.settings,
+                    input_fn=input_fn,
+                )
+                verification = verify_recovery(
+                    investigation["alert"],
+                    diagnosis,
+                    action_result,
+                    approve_rollback=approve_rollback,
+                    execute_rollback=execute_rollback,
+                    runlog=runlog,
+                    timeout_s=self.settings.VERIFY_WINDOW_S,
+                )
+                recovered_or_dry = verification["outcome"] in (
+                    "recovered",
+                    "skipped_dry_run",
+                )
+                status = "success" if recovered_or_dry else "escalated"
             else:
                 rollback_res = None
                 if action_result.get("executed") and action_result.get("rollback"):
@@ -520,7 +544,13 @@ def run_incident(
     # Agent 3: Operator
     operator = Operator(settings=settings)
     execution = operator.execute_and_report(
-        investigation, plan, approval, runlog, dry_run=dry_run, channel=channel
+        investigation,
+        plan,
+        approval,
+        runlog,
+        dry_run=dry_run,
+        channel=channel,
+        input_fn=input_fn,
     )
 
     runlog.log("finish", status=execution["status"], report=execution["report_path"])
