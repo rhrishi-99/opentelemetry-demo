@@ -56,31 +56,40 @@ def cmd_watch(args: argparse.Namespace) -> int:
         os.environ["TELEMETRY_BACKEND"] = "offline"
         os.environ["OFFLINE_SCENARIO"] = args.offline
 
-    from oncall.agent.loop import investigate_and_diagnose
-    from oncall.agent.runlog import RunLog
+    from oncall.agent.orchestrator import run_incident
     from oncall.config import load_settings
     from oncall.platform.alert import watch
-    from oncall.report.output import report_run
+
+    settings = load_settings()
 
     def on_check(entry: dict) -> None:
         found = entry.get("error") or f"{len(entry.get('alerts', []))} alert(s)"
         fired = f" -> fired {entry['fired']}" if "fired" in entry else ""
+        if "quiet_until" in entry:
+            fired += f" -> a human has it; quiet until {entry['quiet_until']}"
+        if "suppressed" in entry:
+            held = entry["suppressed"]
+            fired = (
+                f" (held by a human since run {held.get('run_id')}, "
+                f"{held.get('status')}; quiet until {held.get('until')})"
+            )
         print(f"[{entry['ts']}] {found}{fired}", flush=True)
 
-    def on_alert(alert: Alert) -> None:
+    def on_alert(alert: Alert) -> dict:
         print(f"ALERT {alert['id']}: {alert['description']}", flush=True)
-        runlog = RunLog(runs_dir=load_settings().RUNS_DIR)
-        result = investigate_and_diagnose(alert, runlog=runlog)
-        json_path, md_path = report_run(alert, result["diagnosis"], runlog)
-        d = result["diagnosis"]
+        # The full loop: detective -> planner -> human gate -> operator -> verify -> report.
+        execution = run_incident(
+            alert, channel=args.channel, dry_run=not args.execute, settings=settings
+        )
+        d = execution["plan"]["diagnosis_final"]
         print(
-            f"  run {result['run_id']}: stopped={result['stopped']}, "
+            f"  run {execution['investigation']['run_id']}: status={execution['status']}, "
             f"component={d['component']}, category={d['category']}, "
             f"confidence={d['confidence']:.2f}, decision={d['decision']}\n"
-            f"  run log: {runlog.path}\n"
-            f"  report:  {json_path} + {md_path.name}",
+            f"  report:  {execution['report_path']}",
             flush=True,
         )
+        return execution
 
     try:
         watch(poll_s=args.poll_s, on_alert=on_alert, once=args.once, on_check=on_check)
@@ -139,6 +148,15 @@ def main(argv: list[str] | None = None) -> int:
     w.add_argument("--once", action="store_true", help="run one check and exit")
     w.add_argument("--poll-s", type=int, default=None, help="seconds between checks")
     w.add_argument("--offline", metavar="SCENARIO", default=None)
+    w.add_argument(
+        "--execute",
+        action="store_true",
+        default=False,
+        help="execute approved actions (default is dry-run)",
+    )
+    w.add_argument(
+        "--channel", choices=["cli", "ui"], default="cli", help="approval channel"
+    )
     w.set_defaults(func=cmd_watch)
 
     ks = sub.add_parser("killswitch", help="block every action (on), allow (off)")

@@ -34,6 +34,12 @@ BASELINE_MIN = 30  # baseline = median of the 30 minutes before watch starts
 ERROR_RATE_FACTOR = 3.0
 P95_FACTOR = 2.0
 SUPPRESS_MIN = 10  # after an alert, stay quiet this long unless signals recover
+# When a run ends with a human holding the incident (escalated, aborted by a
+# rejection or the kill switch, or no action found), re-paging every 10 min only
+# burns LLM calls on the same evidence. Stay quiet for a shift instead; signals
+# recovering or a newly stopped container still break through.
+ESCALATED_SUPPRESS_MIN = 480
+HUMAN_HAS_IT = ("escalated", "aborted", "no_action")
 WATCH_LOG = "watch.jsonl"
 
 # Edge services see every user request (frontend-web is the browser). Their
@@ -304,11 +310,13 @@ class Debouncer:
         self.suppress = timedelta(minutes=suppress_min)
         self.quiet_until: datetime | None = None
         self.down: set[str | None] = set()  # containers already alerted on
+        self.held_by: dict | None = None  # the run a human is handling, if any
 
     def should_fire(self, alerts: list[Alert], now: datetime) -> bool:
         if not alerts:
             self.quiet_until = None
             self.down = set()
+            self.held_by = None
             return False
         down = {a["service"] for a in alerts if a["signal"] == "container"}
         quiet = self.quiet_until is not None and now < self.quiet_until
@@ -316,7 +324,14 @@ class Debouncer:
             return False
         self.down = (self.down | down) if quiet else down
         self.quiet_until = now + self.suppress
+        self.held_by = None
         return True
+
+    def hold(self, now: datetime, minutes: int, run: dict) -> datetime:
+        """Extend the quiet period: a human now owns this incident (see run)."""
+        self.quiet_until = now + timedelta(minutes=minutes)
+        self.held_by = {**run, "until": self.quiet_until.isoformat(timespec="seconds")}
+        return self.quiet_until
 
 
 def _print_alert(alert: Alert) -> None:
@@ -341,8 +356,10 @@ def watch(
 ) -> None:
     """Poll every `poll_s` seconds and call `on_alert` once per incident.
 
-    Every check is logged as one line in runs/watch.jsonl and also passed to
-    `on_check` (the CLI prints it).
+    `on_alert` may return the run's Execution (or any dict with a `status`).
+    When that status says a human now holds the incident, the quiet period
+    becomes ESCALATED_SUPPRESS_MIN. Every check is logged as one line in
+    runs/watch.jsonl and also passed to `on_check` (the CLI prints it).
     """
     settings = settings or load_settings()
     poll_s = poll_s or settings.ALERT_POLL_S
@@ -383,10 +400,22 @@ def watch(
                 alert = merge_alerts(alerts)
                 entry["fired"] = alert["id"]
                 try:
-                    on_alert(alert)
+                    result = on_alert(alert)
                 except Exception as exc:  # keep watching even if the agent crashes
                     log.exception("on_alert failed")
                     entry["on_alert_error"] = f"{type(exc).__name__}: {exc}"
+                else:
+                    status = result.get("status") if isinstance(result, dict) else None
+                    if status in HUMAN_HAS_IT:
+                        run_id = (result.get("investigation") or {}).get("run_id")
+                        until = debouncer.hold(
+                            now,
+                            ESCALATED_SUPPRESS_MIN,
+                            {"run_id": run_id, "status": status},
+                        )
+                        entry["quiet_until"] = until.isoformat(timespec="seconds")
+            elif alerts and debouncer.held_by:
+                entry["suppressed"] = debouncer.held_by
         _append_log(log_path, entry)
         if on_check:
             on_check(entry)

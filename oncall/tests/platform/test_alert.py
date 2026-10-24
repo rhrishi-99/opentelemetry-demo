@@ -327,40 +327,131 @@ def test_watch_passes_every_check_to_on_check(tmp_path):
     assert seen[0]["fired"].endswith("-cart-error_rate")
 
 
-def test_cli_watch_hands_alerts_to_the_agent(monkeypatch, tmp_path, capsys):
-    from oncall import main as cli
-
-    monkeypatch.setenv("RUNS_DIR", str(tmp_path))
+def _execution(status: str = "escalated", run_id: str = "r1") -> dict:
     diagnosis = {
         "component": "cart",
         "category": "container_down",
         "confidence": 0.8,
-        "decision": "act",
+        "decision": "act" if status == "success" else "escalate",
     }
-    result = {"run_id": "r1", "stopped": "finish", "diagnosis": diagnosis}
+    return {
+        "investigation": {"run_id": run_id, "diagnosis": diagnosis},
+        "plan": {"diagnosis_final": diagnosis, "proposal": None},
+        "approval": {"approved": False, "by": "human_cli", "ts": "t", "comment": "no"},
+        "action_result": None,
+        "verification": None,
+        "report_path": f"runs/reports/{run_id}.json",
+        "status": status,
+    }
+
+
+def test_cli_watch_runs_the_full_loop_and_defaults_to_dry_run(
+    monkeypatch, tmp_path, capsys
+):
+    from oncall import main as cli
+
+    monkeypatch.setenv("RUNS_DIR", str(tmp_path))
+    fired = []
 
     def fake_watch(poll_s, on_alert, once, on_check):
         assert once is True
-        on_alert(_a("cart", "container"))
+        fired.append(on_alert(_a("cart", "container")))
 
     with (
         mock.patch("oncall.platform.alert.watch", side_effect=fake_watch),
         mock.patch(
-            "oncall.agent.loop.investigate_and_diagnose", return_value=result
-        ) as agent,
-        mock.patch(
-            "oncall.report.output.report_run",
-            return_value=(tmp_path / "r1.json", tmp_path / "r1.md"),
-        ) as report,
+            "oncall.agent.orchestrator.run_incident", return_value=_execution()
+        ) as run,
     ):
         assert cli.main(["watch", "--once"]) == 0
-    assert agent.call_args.args[0]["service"] == "cart"
-    assert report.call_args.args[1] == diagnosis
+    assert run.call_args.args[0]["service"] == "cart"
+    assert run.call_args.kwargs["dry_run"] is True
+    assert run.call_args.kwargs["channel"] == "cli"
+    assert fired[0]["status"] == "escalated"  # the Execution comes back to watch
     out = capsys.readouterr().out
     assert "ALERT" in out
+    assert "status=escalated" in out
     assert "report:" in out
-    assert "component=cart" in out
-    assert "decision=act" in out
+
+
+def test_cli_watch_execute_and_channel_flags(monkeypatch, tmp_path):
+    from oncall import main as cli
+
+    monkeypatch.setenv("RUNS_DIR", str(tmp_path))
+    with (
+        mock.patch(
+            "oncall.platform.alert.watch",
+            side_effect=lambda poll_s, on_alert, once, on_check: on_alert(
+                _a("cart", "container")
+            ),
+        ),
+        mock.patch(
+            "oncall.agent.orchestrator.run_incident",
+            return_value=_execution("success"),
+        ) as run,
+    ):
+        assert cli.main(["watch", "--once", "--execute", "--channel", "ui"]) == 0
+    assert run.call_args.kwargs["dry_run"] is False
+    assert run.call_args.kwargs["channel"] == "ui"
+
+
+def test_hold_keeps_quiet_for_the_shift_but_recovery_and_new_containers_break_through():
+    d = Debouncer(suppress_min=10)
+    cart = _a("cart", "container")
+    assert d.should_fire([cart], NOW) is True
+    until = d.hold(
+        NOW, alert.ESCALATED_SUPPRESS_MIN, {"run_id": "r9", "status": "escalated"}
+    )
+    assert until == NOW + timedelta(hours=8)
+    assert d.held_by["run_id"] == "r9"
+    assert (
+        d.should_fire([cart], NOW + timedelta(minutes=11)) is False
+    )  # not after 10 min
+    assert d.should_fire([cart], NOW + timedelta(hours=7, minutes=59)) is False
+    # a different container going down is a new incident
+    payment = _a("payment", "container")
+    assert d.should_fire([cart, payment], NOW + timedelta(hours=1)) is True
+    # signals recovering clears the hold
+    d.hold(NOW, alert.ESCALATED_SUPPRESS_MIN, {"run_id": "r9", "status": "escalated"})
+    assert d.should_fire([], NOW + timedelta(hours=2)) is False
+    assert d.held_by is None
+    assert d.should_fire([cart], NOW + timedelta(hours=2, minutes=1)) is True
+    # after the shift, it re-pages
+    d.hold(NOW, alert.ESCALATED_SUPPRESS_MIN, {"run_id": "r9", "status": "escalated"})
+    assert d.should_fire([cart], NOW + timedelta(hours=8, minutes=1)) is True
+
+
+def test_watch_holds_after_an_escalated_run_and_logs_the_suppression(tmp_path):
+    settings = Settings(RUNS_DIR=str(tmp_path), ALERT_POLL_S=15)
+    sleep, _calls = _sleep_n_times(2)
+    with pytest.raises(_Stop):
+        watch(
+            on_alert=lambda a: _execution("escalated", run_id="r9"),
+            backend=FakeBackend(errors={"payment": 0.4}),
+            settings=settings,
+            sleep=sleep,
+        )
+    lines = [json.loads(x) for x in (tmp_path / "watch.jsonl").read_text().splitlines()]
+    first, second = lines[1], lines[2]
+    assert "fired" in first
+    quiet_until = datetime.fromisoformat(first["quiet_until"])
+    assert quiet_until - datetime.fromisoformat(first["ts"]) == timedelta(hours=8)
+    assert "fired" not in second
+    assert second["suppressed"]["run_id"] == "r9"
+    assert second["suppressed"]["status"] == "escalated"
+
+
+def test_watch_does_not_hold_after_a_successful_run(tmp_path):
+    settings = Settings(RUNS_DIR=str(tmp_path), ALERT_POLL_S=15)
+    watch(
+        on_alert=lambda a: _execution("success"),
+        once=True,
+        backend=FakeBackend(errors={"payment": 0.4}),
+        settings=settings,
+    )
+    last = json.loads((tmp_path / "watch.jsonl").read_text().splitlines()[-1])
+    assert "fired" in last
+    assert "quiet_until" not in last
 
 
 def test_service_already_failing_at_start_still_alerts():
