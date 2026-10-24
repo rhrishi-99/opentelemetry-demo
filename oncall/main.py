@@ -123,6 +123,77 @@ def cmd_run(args: argparse.Namespace) -> int:
     return 0 if execution["status"] in ("success", "no_action") else 1
 
 
+HUMAN_DIRECTED = "human-directed action"
+
+
+def cmd_act(args: argparse.Namespace) -> int:
+    """A human picks the action; it still goes through the same gate (exact "yes"),
+    executor (kill switch, allowlist, Action API, actions.jsonl) and verify. No LLM."""
+    from pathlib import Path
+
+    from oncall.agent.proposer import ACTION_RISK, ROLLBACK_HINT
+    from oncall.agent.runlog import RunLog
+    from oncall.config import load_settings
+    from oncall.report.output import report_run
+    from oncall.safety import executor
+    from oncall.safety import verify as verify_mod
+
+    settings = load_settings()
+    run = RunLog(runs_dir=settings.RUNS_DIR)
+    reason = args.reason or f"operator asked to {args.action} {args.target}"
+    proposal = {
+        "action": args.action,
+        "target": args.target,
+        "params": {"users": args.users} if args.users is not None else {},
+        "reason": reason,
+        "expected_effect": f"{args.target} recovers after {args.action}",
+        "rollback_hint": ROLLBACK_HINT.get(
+            args.action, "Escalate if it does not help."
+        ),
+        "risk": ACTION_RISK.get(args.action, "medium"),
+        "source": "human",
+    }
+    alert = _manual_alert(args.target, f"{HUMAN_DIRECTED}: {args.action} {args.target}")
+    alert["source"] = "human"
+    diagnosis = {
+        "component": args.target,
+        "category": "unknown",
+        "cause": f"No agent diagnosis: {reason}",
+        "confidence": 0.0,
+        "evidence_ids": [],
+        "affected_services": [args.target],
+        "alternatives": [],
+        "decision": "act",
+        "reasoning": f"{HUMAN_DIRECTED} (no LLM, no agent diagnosis): {reason}",
+    }
+    run.log("alert", alert=alert)
+    run.log("handoff", **{"from": "human", "to": "human_gate", "proposal": proposal})
+    result = executor.execute(
+        proposal,  # type: ignore[arg-type]
+        run,
+        dry_run=not args.execute,
+        diagnosis=diagnosis,  # type: ignore[arg-type]
+        channel="cli",
+        settings=settings,
+    )
+    verification = verify_mod.verify(alert, diagnosis, result, runlog=run)  # type: ignore[arg-type]
+    json_path, _ = report_run(
+        alert,
+        diagnosis,  # type: ignore[arg-type]
+        run,
+        out_dir=Path(settings.RUNS_DIR) / "reports",
+        actions=[result],
+        verification=verification,
+    )
+    print(f"run_id:       {run.run_id}")
+    print(f"action:       {args.action}({args.target}) dry_run={not args.execute}")
+    print(f"result:       {result['detail']}")
+    print(f"verification: {verification['outcome']}")
+    print(f"report:       {json_path}")
+    done = result["ok"] and verification["outcome"] in ("recovered", "skipped_dry_run")
+    return 0 if done else 1
+
+
 def main(argv: list[str] | None = None) -> int:
     if hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(errors="replace")
@@ -144,6 +215,17 @@ def main(argv: list[str] | None = None) -> int:
     ks = sub.add_parser("killswitch", help="block every action (on), allow (off)")
     ks.add_argument("state", choices=["on", "off", "status"])
     ks.set_defaults(func=cmd_killswitch)
+    a = sub.add_parser(
+        "act", help="run one human-chosen action through the same gate and executor"
+    )
+    a.add_argument("--action", required=True, help="e.g. start_service")
+    a.add_argument("--target", required=True, help="demo service, e.g. valkey-cart")
+    a.add_argument("--reason", help="why (goes into the action log and report)")
+    a.add_argument("--users", type=int, help="user count for throttle_load")
+    a.add_argument(
+        "--execute", action="store_true", help="really act (default is a dry run)"
+    )
+    a.set_defaults(func=cmd_act)
     r = sub.add_parser("run", help="run full remediation orchestrator on an incident")
     r.add_argument("--description", required=True, help="incident description")
     r.add_argument("--service", default=None, help="target service name")
