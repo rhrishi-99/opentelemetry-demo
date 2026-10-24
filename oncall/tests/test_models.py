@@ -122,3 +122,99 @@ def test_every_registered_tool_goes_through_the_scrubbing_wrapper():
     assert len(wrapper_code) == 1
     assert {"container_health", "deploy_history", "get_metrics"} <= TOOLS.keys()
     assert all(hasattr(fn, "__wrapped__") for fn in TOOLS.values())
+
+
+def test_cp3_models_instantiation():
+    from oncall.models import (
+        ActionRequest,
+        ActionResult,
+        Alert,
+        Approval,
+        Diagnosis,
+        Execution,
+        Investigation,
+        Plan,
+        Proposal,
+    )
+
+    alert: Alert = {
+        "id": "alt-1",
+        "ts": "2026-10-24T10:00:00Z",
+        "service": "cart",
+        "signal": "error_rate",
+        "value": 0.45,
+        "threshold": 0.05,
+        "description": "cart error rate spike",
+        "source": "detector",
+    }
+    diagnosis: Diagnosis = {
+        "component": "cart",
+        "category": "app_error",
+        "cause": "unhandled error in cart",
+        "confidence": 0.9,
+        "evidence_ids": ["log:cart@2026-10-24T10:00:00Z"],
+        "affected_services": ["frontend"],
+        "alternatives": [],
+        "decision": "act",
+        "reasoning": "log points to cart crash",
+    }
+    investigation: Investigation = {
+        "alert": alert,
+        "diagnosis": diagnosis,
+        "evidence_valid": True,
+        "run_id": "run-123",
+    }
+    proposal: Proposal = {
+        "action": "restart_service",
+        "target": "cart",
+        "params": {},
+        "reason": "restart cart container",
+        "expected_effect": "recover cart errors",
+        "rollback_hint": "none",
+        "risk": "low",
+    }
+    plan: Plan = {
+        "review": {"challenges": []},
+        "diagnosis_final": diagnosis,
+        "proposal": proposal,
+        "prevention": "fix cart nil pointer exception",
+    }
+    approval: Approval = {
+        "approved": True,
+        "by": "human_operator",
+        "ts": "2026-10-24T10:05:00Z",
+        "comment": "lgtm",
+    }
+    action_req: ActionRequest = {
+        "action": "restart_service",
+        "target": "cart",
+        "params": {},
+        "reason": "restart cart container",
+        "run_id": "run-123",
+        "dry_run": False,
+    }
+    action_res: ActionResult = {
+        "request": action_req,
+        "allowed": True,
+        "executed": True,
+        "dry_run": False,
+        "ok": True,
+        "detail": "container restarted",
+        "before": {"status": "restarting"},
+        "after": {"status": "running"},
+        "rollback": None,
+        "ts": "2026-10-24T10:05:10Z",
+    }
+    execution: Execution = {
+        "investigation": investigation,
+        "plan": plan,
+        "approval": approval,
+        "action_result": action_res,
+        "verification": {"recovered": True},
+        "report_path": "runs/reports/run-123.json",
+        "status": "success",
+    }
+
+    assert execution["status"] == "success"
+    assert execution["action_result"]["allowed"] is True
+    assert execution["plan"]["proposal"]["action"] == "restart_service"

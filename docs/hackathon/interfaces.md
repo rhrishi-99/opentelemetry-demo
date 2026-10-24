@@ -61,12 +61,80 @@ Diagnosis with `category="unknown"` and `component=None`; it never raises.
 - `container_health(service: str | None = None) -> dict`
 - `deploy_history(window_min: int = 60) -> dict`
 
-## Safety / action (owner: safety)
-- `propose_action(action: str, target: str, params: dict, reason: str) -> Proposal`  — validates against allowlist
-- `request_approval(proposal: Proposal, diagnosis: dict) -> bool`
-- `execute(proposal: Proposal, dry_run: bool) -> dict`
-- `verify_recovery(service: str, baseline: dict, timeout_s: int) -> dict`
-- `kill_switch_engaged() -> bool`
+## ActionRequest & ActionResult (owner: safety, F19)
+Defined in `oncall/models.py`.
+```python
+ActionRequest = {
+    "action": str,
+    "target": str,
+    "params": dict,
+    "reason": str,
+    "run_id": str,
+    "dry_run": bool,
+}
+
+ActionResult = {
+    "request": ActionRequest,
+    "allowed": bool,
+    "executed": bool,
+    "dry_run": bool,
+    "ok": bool,
+    "detail": str,
+    "before": dict,
+    "after": dict,
+    "rollback": ActionRequest | None,
+    "ts": str,
+}
+```
+
+## Proposal & Plan (owner: brain/planner, F22)
+Defined in `oncall/models.py`.
+```python
+Proposal = {
+    "action": str,
+    "target": str,
+    "params": dict,
+    "reason": str,
+    "expected_effect": str,
+    "rollback_hint": str,
+    "risk": "low" | "medium",
+}
+
+Plan = {
+    "review": dict,  # challenges, ruled_out status, confidence_adjustment
+    "diagnosis_final": Diagnosis,
+    "proposal": Proposal | None,
+    "prevention": str,
+}
+```
+
+## Hand-offs: Investigation, Approval, Execution (owner: orchestrator, F28)
+Defined in `oncall/models.py`.
+```python
+Investigation = {
+    "alert": Alert,
+    "diagnosis": Diagnosis,
+    "evidence_valid": bool,
+    "run_id": str,
+}
+
+Approval = {
+    "approved": bool,
+    "by": str,
+    "ts": str,
+    "comment": str,
+}
+
+Execution = {
+    "investigation": Investigation,
+    "plan": Plan,
+    "approval": Approval,
+    "action_result": ActionResult | None,
+    "verification": dict | None,
+    "report_path": str | None,
+    "status": "success" | "escalated" | "aborted" | "no_action",
+}
+```
 
 ## Incident report
 Must validate against the organisers' JSON schema in the template (path: `TBD`). Never edit that schema.

@@ -73,6 +73,69 @@ class Diagnosis(TypedDict):
     reasoning: str
 
 
+class ActionRequest(TypedDict):
+    action: str
+    target: str
+    params: dict
+    reason: str
+    run_id: str
+    dry_run: bool
+
+
+class ActionResult(TypedDict):
+    request: ActionRequest
+    allowed: bool
+    executed: bool
+    dry_run: bool
+    ok: bool
+    detail: str
+    before: dict
+    after: dict
+    rollback: ActionRequest | None
+    ts: str
+
+
+class Proposal(TypedDict):
+    action: str
+    target: str
+    params: dict
+    reason: str
+    expected_effect: str
+    rollback_hint: str
+    risk: Literal["low", "medium"]
+
+
+class Plan(TypedDict):
+    review: dict
+    diagnosis_final: Diagnosis
+    proposal: Proposal | None
+    prevention: str
+
+
+class Investigation(TypedDict):
+    alert: Alert
+    diagnosis: Diagnosis
+    evidence_valid: bool
+    run_id: str
+
+
+class Approval(TypedDict):
+    approved: bool
+    by: str
+    ts: str
+    comment: str
+
+
+class Execution(TypedDict):
+    investigation: Investigation
+    plan: Plan
+    approval: Approval
+    action_result: ActionResult | None
+    verification: dict | None
+    report_path: str | None
+    status: Literal["success", "escalated", "aborted", "no_action"]
+
+
 def make_result(
     tool: str, query: dict, summary: str, evidence: list[Evidence]
 ) -> ToolResult:
