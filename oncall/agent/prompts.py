@@ -94,3 +94,30 @@ containers running), the system is healthy: category no_incident, component \
 null, decision no_action, and confidence is how sure you are that nothing is \
 wrong. High CPU on a container without a CPU limit is not a fault by itself.
 - reasoning: at most 800 characters, citing evidence ids in square brackets."""
+
+PROPOSE = """\
+Write a concise human-readable reason and expected effect for the fixed action
+below. Do not choose, change, or add an action. Return only a JSON object with
+string fields "reason" and "expected_effect".
+
+Diagnosis:
+{diagnosis}
+
+Fixed action: {action} target={target} params={params}
+Evidence:
+{evidence}"""
+
+REVIEW = """\
+Try to disprove the diagnosis using only the evidence listed below. Do not call
+tools or request more evidence. Return only JSON with a "challenges" list of
+one or two objects, each containing "hypothesis", "ruled_out" (boolean),
+"evidence_ids" (ids from the list only), and "reason". Also return
+"confidence_adjustment" as a number from -0.5 to 0. If existing evidence does
+not rule out a challenge, set ruled_out to false. Never claim a challenge was
+ruled out without citing existing evidence.
+
+Diagnosis:
+{diagnosis}
+
+Existing evidence (id and text):
+{evidence}"""
