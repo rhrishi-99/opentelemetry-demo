@@ -143,13 +143,12 @@ class Planner:
         if (
             not investigation.get("evidence_valid", False)
             or final_diagnosis.get("confidence", 0.0) < 0.7
-        ):
-            if final_diagnosis.get("decision") == "act":
-                final_diagnosis["decision"] = "escalate"
-                final_diagnosis["reasoning"] = (
-                    f"{final_diagnosis.get('reasoning', '')} "
-                    "[Planner: downgraded to escalate due to insufficient confidence or evidence]"
-                ).strip()
+        ) and final_diagnosis.get("decision") == "act":
+            final_diagnosis["decision"] = "escalate"
+            final_diagnosis["reasoning"] = (
+                f"{final_diagnosis.get('reasoning', '')} "
+                "[Planner: downgraded to escalate due to insufficient confidence or evidence]"
+            ).strip()
 
         decision = final_diagnosis.get("decision", "escalate")
 
@@ -361,9 +360,7 @@ class Operator:
             status = "aborted"
         elif diagnosis.get("decision") == "no_incident":
             status = "no_action"
-        elif diagnosis.get("decision") == "escalate":
-            status = "escalated"
-        elif proposal is None:
+        elif diagnosis.get("decision") == "escalate" or proposal is None:
             status = "escalated"
         elif not approval.get("approved"):
             status = "aborted"
